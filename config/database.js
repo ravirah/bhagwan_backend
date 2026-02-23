@@ -3,8 +3,26 @@ const { Sequelize } = require('sequelize');
 
 class DatabaseFactory {
   constructor() {
-    this.dbType = process.env.DB_TYPE || 'mongodb';
+    this.dbType = this.detectDbType();
     this.connection = null;
+    console.log(`🔍 Detected DB_TYPE: "${this.dbType}" (env DB_TYPE: "${process.env.DB_TYPE}")`);
+    console.log(`🔍 MYSQL_HOST present: ${!!process.env.MYSQL_HOST}`);
+    console.log(`🔍 All env keys: ${Object.keys(process.env).filter(k => k.startsWith('MYSQL') || k.startsWith('DB_') || k.startsWith('MONGO') || k.startsWith('POSTGRES')).join(', ')}`);
+  }
+
+  detectDbType() {
+    // Auto-detect: if MySQL credentials exist, use MySQL regardless of DB_TYPE
+    if (process.env.MYSQL_HOST && process.env.MYSQL_DATABASE) {
+      return 'mysql';
+    }
+    if (process.env.POSTGRES_HOST && process.env.POSTGRES_DATABASE) {
+      return 'postgres';
+    }
+    if (process.env.MONGODB_URI) {
+      return 'mongodb';
+    }
+    // Fall back to DB_TYPE env var or sqlite as last resort
+    return process.env.DB_TYPE || 'sqlite';
   }
 
   async connect() {

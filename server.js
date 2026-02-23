@@ -53,8 +53,12 @@ app.get('/api/health', (req, res) => {
     status: 'OK',
     timestamp: new Date().toISOString(),
     database: {
-      type: dbFactory.getType(),
+      type: db ? db.type : (process.env.DB_TYPE || 'not connected'),
       connected: db ? true : false
+    },
+    env: {
+      DB_TYPE: process.env.DB_TYPE || 'not set',
+      NODE_ENV: process.env.NODE_ENV || 'not set'
     }
   });
 });

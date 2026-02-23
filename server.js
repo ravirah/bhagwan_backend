@@ -19,10 +19,6 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Debug: log DB_TYPE to diagnose env var issues
-console.log(`🔍 DB_TYPE env var: "${process.env.DB_TYPE}"`);
-console.log(`🔍 NODE_ENV: "${process.env.NODE_ENV}"`);
-
 // Initialize Database
 let db = null;
 
@@ -59,10 +55,6 @@ app.get('/api/health', (req, res) => {
       type: db ? db.type : (process.env.DB_TYPE || 'not connected'),
       connected: db ? true : false
     },
-    env: {
-      DB_TYPE: process.env.DB_TYPE || 'not set',
-      NODE_ENV: process.env.NODE_ENV || 'not set'
-    }
   });
 });
 

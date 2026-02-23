@@ -5,9 +5,6 @@ class DatabaseFactory {
   constructor() {
     this.dbType = this.detectDbType();
     this.connection = null;
-    console.log(`🔍 Detected DB_TYPE: "${this.dbType}" (env DB_TYPE: "${process.env.DB_TYPE}")`);
-    console.log(`🔍 MYSQL_HOST present: ${!!process.env.MYSQL_HOST}`);
-    console.log(`🔍 All env keys: ${Object.keys(process.env).filter(k => k.startsWith('MYSQL') || k.startsWith('DB_') || k.startsWith('MONGO') || k.startsWith('POSTGRES')).join(', ')}`);
   }
 
   detectDbType() {

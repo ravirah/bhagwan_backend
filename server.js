@@ -16,6 +16,10 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Debug: log DB_TYPE to diagnose env var issues
+console.log(`🔍 DB_TYPE env var: "${process.env.DB_TYPE}"`);
+console.log(`🔍 NODE_ENV: "${process.env.NODE_ENV}"`);
+
 // Initialize Database
 let db = null;
 

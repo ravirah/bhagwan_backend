@@ -68,11 +68,7 @@ async function initModels(sequelize) {
     },
     userId: {
       type: DataTypes.INTEGER,
-      allowNull: false,
-      references: {
-        model: 'Users',
-        key: 'id'
-      }
+      allowNull: false
     },
     appId: {
       type: DataTypes.STRING,
@@ -113,11 +109,7 @@ async function initModels(sequelize) {
     },
     userId: {
       type: DataTypes.INTEGER,
-      allowNull: false,
-      references: {
-        model: 'Users',
-        key: 'id'
-      }
+      allowNull: false
     },
     appId: {
       type: DataTypes.STRING,
@@ -153,12 +145,12 @@ async function initModels(sequelize) {
     ]
   });
 
-  // Associations
-  User.hasMany(Activity, { foreignKey: 'userId' });
-  Activity.belongsTo(User, { foreignKey: 'userId' });
-  
-  User.hasMany(DailySummary, { foreignKey: 'userId' });
-  DailySummary.belongsTo(User, { foreignKey: 'userId' });
+  // Associations - explicit constraint names to avoid conflicts on shared hosting
+  User.hasMany(Activity, { foreignKey: 'userId', constraints: false });
+  Activity.belongsTo(User, { foreignKey: 'userId', constraints: false });
+
+  User.hasMany(DailySummary, { foreignKey: 'userId', constraints: false });
+  DailySummary.belongsTo(User, { foreignKey: 'userId', constraints: false });
 
   // Sync database
   // Use force: true for fresh database (WARNING: deletes existing data)

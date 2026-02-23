@@ -1,4 +1,7 @@
-require('dotenv').config();
+// Only load .env file in development - in production, use system env vars
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
 const express = require('express');
 const cors = require('cors');
 const dbFactory = require('./config/database');

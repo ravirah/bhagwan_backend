@@ -164,7 +164,7 @@ async function initModels(sequelize) {
   // Use force: true for fresh database (WARNING: deletes existing data)
   // Use alter: true for migrations (can be slow/buggy with SQLite)
   // Use no options for just creating missing tables
-  await sequelize.sync();
+  await sequelize.sync({ alter: true });
   console.log('✅ SQL Models Synchronized');
 
   return { User, Activity, DailySummary };

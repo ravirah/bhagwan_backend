@@ -42,6 +42,11 @@ async function initModels(sequelize) {
       allowNull: false,
       defaultValue: 'ram-bank'
     },
+    status: {
+      type: DataTypes.ENUM('pending', 'approved', 'rejected'),
+      defaultValue: 'pending',
+      allowNull: false
+    },
     totalCount: {
       type: DataTypes.INTEGER,
       defaultValue: 0
@@ -51,6 +56,7 @@ async function initModels(sequelize) {
       defaultValue: DataTypes.NOW
     }
   }, {
+    tableName: 'users',
     timestamps: true,
     indexes: [
       { fields: ['email'] },
@@ -76,7 +82,7 @@ async function initModels(sequelize) {
       defaultValue: 'ram-bank'
     },
     activityType: {
-      type: DataTypes.ENUM('COUNT_INCREMENT', 'REGISTER', 'LOGIN', 'LOGOUT', 'PROFILE_UPDATE', 'DAILY_RESET'),
+      type: DataTypes.ENUM('COUNT_INCREMENT', 'REGISTER', 'LOGIN', 'LOGOUT', 'PROFILE_UPDATE', 'DAILY_RESET', 'APPROVAL', 'REJECTION'),
       allowNull: false
     },
     count: {
@@ -92,6 +98,7 @@ async function initModels(sequelize) {
       defaultValue: DataTypes.NOW
     }
   }, {
+    tableName: 'activities',
     timestamps: false,
     indexes: [
       { fields: ['userId'] },
@@ -133,12 +140,13 @@ async function initModels(sequelize) {
       defaultValue: 0
     }
   }, {
+    tableName: 'dailysummaries',
     timestamps: true,
     indexes: [
       { fields: ['userId'] },
       { fields: ['date'] },
       { fields: ['appId'] },
-      { 
+      {
         unique: true,
         fields: ['userId', 'date']
       }

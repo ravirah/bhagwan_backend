@@ -59,6 +59,99 @@ router.get('/users', authMiddleware, adminMiddleware, async (req, res) => {
   }
 });
 
+// Update user status (approve / reject)
+router.put('/users/:userId/status', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User, Activity } = getModels();
+    const { userId } = req.params;
+    const { status } = req.body;
+
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Status must be approved or rejected' });
+    }
+
+    let user;
+    if (dbFactory.isMongoDB()) {
+      user = await User.findByIdAndUpdate(userId, { status }, { new: true });
+    } else {
+      await User.update({ status }, { where: { id: userId } });
+      user = await User.findByPk(userId);
+    }
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const activityType = status === 'approved' ? 'APPROVAL' : 'REJECTION';
+    await Activity.create({
+      userId: user._id || user.id,
+      appId: user.appId,
+      activityType,
+      metadata: { updatedBy: 'admin', timestamp: new Date() }
+    });
+
+    res.json({ success: true, user });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Edit user details
+router.put('/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User } = getModels();
+    const { userId } = req.params;
+    const { name, mobile, email } = req.body;
+
+    if (!name || !mobile) {
+      return res.status(400).json({ success: false, message: 'Name and mobile are required' });
+    }
+
+    let user;
+    if (dbFactory.isMongoDB()) {
+      user = await User.findByIdAndUpdate(userId, { name, mobile, email }, { new: true });
+    } else {
+      await User.update({ name, mobile, email }, { where: { id: userId } });
+      user = await User.findByPk(userId);
+    }
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    res.json({ success: true, user });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Delete user and all their data
+router.delete('/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User, Activity, DailySummary } = getModels();
+    const { userId } = req.params;
+
+    let user;
+    if (dbFactory.isMongoDB()) {
+      user = await User.findById(userId);
+      if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+      await Activity.deleteMany({ userId });
+      await DailySummary.deleteMany({ userId });
+      await User.findByIdAndDelete(userId);
+    } else {
+      user = await User.findByPk(userId);
+      if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+      await Activity.destroy({ where: { userId } });
+      await DailySummary.destroy({ where: { userId } });
+      await User.destroy({ where: { id: userId } });
+    }
+
+    res.json({ success: true, message: 'User deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // Get user details with activities
 router.get('/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
   try {
@@ -180,20 +273,27 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
 
       const totalUsers = await User.countDocuments(userQuery);
       const activeToday = await Activity.countDocuments(activityQuery);
-      
+      const pendingUsers = await User.countDocuments({ ...userQuery, status: 'pending' });
+
       // Now we can directly filter DailySummary by appId
       const summaryQuery = { date: today };
       if (appId) summaryQuery.appId = appId;
-      
+
       const todaySummary = await DailySummary.aggregate([
         { $match: summaryQuery },
         { $group: { _id: null, totalCount: { $sum: '$dailyCount' } } }
       ]);
-      
+
+      // All-time total across all users
+      const allTimeUsers = await User.find({ ...(appId && { appId }) }, 'totalCount');
+      const allTimeTotalCount = allTimeUsers.reduce((sum, u) => sum + (u.totalCount || 0), 0);
+
       stats = {
         totalUsers,
         activeToday,
-        todayTotalCount: todaySummary[0]?.totalCount || 0
+        pendingUsers,
+        todayTotalCount: todaySummary[0]?.totalCount || 0,
+        allTimeTotalCount,
       };
     } else {
       const userWhere = { ...(appId && { appId }) };
@@ -202,27 +302,35 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
         timestamp: { [Op.gte]: moment().startOf('day').toDate() },
         ...(appId && { appId })
       };
-      
+
       console.log('📊 SQL userWhere:', JSON.stringify(userWhere));
 
       const totalUsers = await User.count({ where: userWhere });
       const activeToday = await Activity.count({ where: activityWhere });
-      
+      const pendingUsers = await User.count({ where: { ...userWhere, status: 'pending' } });
+
       // Now we can directly filter DailySummary by appId
       const summaryWhere = { date: today };
       if (appId) summaryWhere.appId = appId;
-      
+
       const todaySummary = await DailySummary.sum('dailyCount', {
         where: summaryWhere
       }) || 0;
-      
+
+      // All-time total: sum of totalCount across all users
+      const allTimeTotalCount = await User.sum('totalCount', { where: userWhere }) || 0;
+
       console.log('📊 Total users found:', totalUsers);
+      console.log('📊 Pending users:', pendingUsers);
       console.log('📊 Today total count:', todaySummary);
-      
+      console.log('📊 All-time total count:', allTimeTotalCount);
+
       stats = {
         totalUsers,
         activeToday,
-        todayTotalCount: todaySummary
+        pendingUsers,
+        todayTotalCount: todaySummary,
+        allTimeTotalCount,
       };
     }
 

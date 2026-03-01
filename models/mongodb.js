@@ -25,6 +25,11 @@ const userSchema = new mongoose.Schema({
     default: 'ram-bank',
     index: true
   },
+  status: {
+    type: String,
+    enum: ['pending', 'approved', 'rejected'],
+    default: 'pending'
+  },
   totalCount: {
     type: Number,
     default: 0
@@ -52,7 +57,7 @@ const activitySchema = new mongoose.Schema({
   activityType: {
     type: String,
     required: true,
-    enum: ['COUNT_INCREMENT', 'REGISTER', 'LOGIN', 'LOGOUT', 'PROFILE_UPDATE', 'DAILY_RESET']
+    enum: ['COUNT_INCREMENT', 'REGISTER', 'LOGIN', 'LOGOUT', 'PROFILE_UPDATE', 'DAILY_RESET', 'APPROVAL', 'REJECTION']
   },
   count: {
     type: Number,

@@ -39,8 +39,8 @@ router.post('/login', async (req, res) => {
       // Look up user by mobile within this app
       user = await User.findOne({ mobile, appId });
       if (!user) {
-        // New user - auto-create account
-        user = new User({ name, mobile, appId });
+        // New user - auto-create account with pending status
+        user = new User({ name, mobile, appId, status: 'pending' });
         await user.save();
         isNewUser = true;
       }
@@ -48,8 +48,8 @@ router.post('/login', async (req, res) => {
       // SQL databases
       user = await User.findOne({ where: { mobile, appId } });
       if (!user) {
-        // New user - auto-create account
-        user = await User.create({ name, mobile, appId });
+        // New user - auto-create account with pending status
+        user = await User.create({ name, mobile, appId, status: 'pending' });
         isNewUser = true;
       }
     }
@@ -71,10 +71,29 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    // Block non-approved users
+    if (user.status !== 'approved') {
+      const message = user.status === 'rejected'
+        ? 'Your account has been rejected. Please contact admin.'
+        : 'Your account is pending admin approval. Please contact admin.';
+      return res.json({
+        success: true,
+        approved: false,
+        status: user.status,
+        message,
+        user: {
+          id: user._id || user.id,
+          name: user.name,
+          mobile: user.mobile,
+          status: user.status
+        }
+      });
+    }
+
     // Generate token
     const token = jwt.sign(
-      { 
-        userId: user._id || user.id, 
+      {
+        userId: user._id || user.id,
         name: user.name,
         isAdmin: false
       },
@@ -84,13 +103,15 @@ router.post('/login', async (req, res) => {
 
     res.json({
       success: true,
+      approved: true,
       token,
       user: {
         id: user._id || user.id,
         name: user.name,
         email: user.email,
         mobile: user.mobile,
-        totalCount: user.totalCount
+        totalCount: user.totalCount,
+        status: user.status
       }
     });
   } catch (error) {

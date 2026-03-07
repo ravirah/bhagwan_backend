@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware - CORS Configuration
 const corsOptions = {
-  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
+  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
   credentials: true,
   optionsSuccessStatus: 200
 };

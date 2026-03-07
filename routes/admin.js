@@ -263,19 +263,16 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
     let stats;
     if (dbFactory.isMongoDB()) {
       const userQuery = { ...(appId && { appId }) };
-      const activityQuery = { 
+      const activityQuery = {
         activityType: 'LOGIN',
         timestamp: { $gte: moment().startOf('day').toDate() },
         ...(appId && { appId })
       };
 
-      console.log('📊 MongoDB userQuery:', JSON.stringify(userQuery));
-
       const totalUsers = await User.countDocuments(userQuery);
       const activeToday = await Activity.countDocuments(activityQuery);
       const pendingUsers = await User.countDocuments({ ...userQuery, status: 'pending' });
 
-      // Now we can directly filter DailySummary by appId
       const summaryQuery = { date: today };
       if (appId) summaryQuery.appId = appId;
 
@@ -284,9 +281,23 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
         { $group: { _id: null, totalCount: { $sum: '$dailyCount' } } }
       ]);
 
-      // All-time total across all users
-      const allTimeUsers = await User.find({ ...(appId && { appId }) }, 'totalCount');
+      const allTimeUsers = await User.find({ ...(appId && { appId }) }, 'totalCount name');
       const allTimeTotalCount = allTimeUsers.reduce((sum, u) => sum + (u.totalCount || 0), 0);
+
+      // Top chanter all-time
+      const topAllTime = await User.findOne(userQuery).sort({ totalCount: -1 }).select('name totalCount');
+
+      // Top chanter today
+      const topTodayAgg = await DailySummary.aggregate([
+        { $match: summaryQuery },
+        { $sort: { dailyCount: -1 } },
+        { $limit: 1 }
+      ]);
+      let topToday = null;
+      if (topTodayAgg.length > 0) {
+        const topUser = await User.findById(topTodayAgg[0].userId, 'name');
+        topToday = { name: topUser?.name || 'Unknown', count: topTodayAgg[0].dailyCount };
+      }
 
       stats = {
         totalUsers,
@@ -294,6 +305,8 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
         pendingUsers,
         todayTotalCount: todaySummary[0]?.totalCount || 0,
         allTimeTotalCount,
+        topChanterToday: topToday,
+        topChanterAllTime: topAllTime ? { name: topAllTime.name, count: topAllTime.totalCount } : null,
       };
     } else {
       const userWhere = { ...(appId && { appId }) };
@@ -303,13 +316,10 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
         ...(appId && { appId })
       };
 
-      console.log('📊 SQL userWhere:', JSON.stringify(userWhere));
-
       const totalUsers = await User.count({ where: userWhere });
       const activeToday = await Activity.count({ where: activityWhere });
       const pendingUsers = await User.count({ where: { ...userWhere, status: 'pending' } });
 
-      // Now we can directly filter DailySummary by appId
       const summaryWhere = { date: today };
       if (appId) summaryWhere.appId = appId;
 
@@ -317,13 +327,21 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
         where: summaryWhere
       }) || 0;
 
-      // All-time total: sum of totalCount across all users
       const allTimeTotalCount = await User.sum('totalCount', { where: userWhere }) || 0;
 
-      console.log('📊 Total users found:', totalUsers);
-      console.log('📊 Pending users:', pendingUsers);
-      console.log('📊 Today total count:', todaySummary);
-      console.log('📊 All-time total count:', allTimeTotalCount);
+      // Top chanter all-time
+      const topAllTimeUser = await User.findOne({
+        where: userWhere,
+        order: [['totalCount', 'DESC']],
+        attributes: ['name', 'totalCount'],
+      });
+
+      // Top chanter today
+      const topTodaySummary = await DailySummary.findOne({
+        where: summaryWhere,
+        order: [['dailyCount', 'DESC']],
+        include: [{ model: User, attributes: ['name'] }],
+      });
 
       stats = {
         totalUsers,
@@ -331,6 +349,8 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
         pendingUsers,
         todayTotalCount: todaySummary,
         allTimeTotalCount,
+        topChanterToday: topTodaySummary ? { name: topTodaySummary.User?.name || 'Unknown', count: topTodaySummary.dailyCount } : null,
+        topChanterAllTime: topAllTimeUser ? { name: topAllTimeUser.name, count: topAllTimeUser.totalCount } : null,
       };
     }
 

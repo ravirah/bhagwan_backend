@@ -36,21 +36,29 @@ router.post('/login', async (req, res) => {
     let isNewUser = false;
 
     if (dbFactory.isMongoDB()) {
-      // Look up user by mobile within this app
+      // Look up user by mobile within this app (mobile is the unique key)
       user = await User.findOne({ mobile, appId });
       if (!user) {
         // New user - auto-create account with pending status
         user = new User({ name, mobile, appId, status: 'pending' });
         await user.save();
         isNewUser = true;
+      } else if (name && user.name !== name) {
+        // Existing user logging in with updated name — update it
+        user.name = name;
+        await user.save();
       }
     } else {
-      // SQL databases
+      // SQL databases — mobile is the unique key
       user = await User.findOne({ where: { mobile, appId } });
       if (!user) {
         // New user - auto-create account with pending status
         user = await User.create({ name, mobile, appId, status: 'pending' });
         isNewUser = true;
+      } else if (name && user.name !== name) {
+        // Existing user logging in with updated name — update it
+        await User.update({ name }, { where: { id: user.id } });
+        user = await User.findByPk(user.id);
       }
     }
 
@@ -120,6 +128,44 @@ router.post('/login', async (req, res) => {
       success: false, 
       message: error.message 
     });
+  }
+});
+
+// Lookup user by mobile — returns name if user exists (no side-effects)
+router.post('/lookup', async (req, res) => {
+  try {
+    const { mobile, appId = 'ram-bank' } = req.body;
+
+    if (!mobile) {
+      return res.status(400).json({ success: false, message: 'Mobile number is required' });
+    }
+
+    const { User } = getModels();
+    const dbFactory = require('../config/database');
+
+    let user;
+    if (dbFactory.isMongoDB()) {
+      user = await User.findOne({ mobile, appId });
+    } else {
+      user = await User.findOne({ where: { mobile, appId } });
+    }
+
+    if (user) {
+      return res.json({
+        success: true,
+        exists: true,
+        user: {
+          name: user.name,
+          mobile: user.mobile,
+          status: user.status,
+        },
+      });
+    }
+
+    return res.json({ success: true, exists: false });
+  } catch (error) {
+    console.error('Lookup error:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 

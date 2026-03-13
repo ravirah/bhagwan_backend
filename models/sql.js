@@ -178,11 +178,11 @@ async function initModels(sequelize) {
       defaultValue: 'ram-bank'
     },
     hi: {
-      type: DataTypes.TEXT,
+      type: DataTypes.STRING(255),
       allowNull: false
     },
     en: {
-      type: DataTypes.TEXT,
+      type: DataTypes.STRING(255),
       allowNull: false
     }
   }, {

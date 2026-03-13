@@ -1,4 +1,17 @@
 const { DataTypes } = require('sequelize');
+const defaultSlogans = require('../config/defaultSlogans');
+
+async function seedDefaultSlogans(SloganModel) {
+  for (const [appId, slogans] of Object.entries(defaultSlogans)) {
+    for (const slogan of slogans) {
+      await SloganModel.findOrCreate({
+        where: { appId, hi: slogan.hi },
+        defaults: { appId, hi: slogan.hi, en: slogan.en },
+      });
+    }
+  }
+}
+
 
 /**
  * MULTI-APP ARCHITECTURE
@@ -12,7 +25,7 @@ const { DataTypes } = require('sequelize');
  * Database has UNIQUE constraint on (appId, mobile) - same mobile can exist in different apps.
  */
 
-let User, Activity, DailySummary;
+let User, Activity, DailySummary, Slogan;
 
 async function initModels(sequelize) {
   User = sequelize.define('User', {
@@ -153,6 +166,35 @@ async function initModels(sequelize) {
     ]
   });
 
+  Slogan = sequelize.define('Slogan', {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true
+    },
+    appId: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: 'ram-bank'
+    },
+    hi: {
+      type: DataTypes.TEXT,
+      allowNull: false
+    },
+    en: {
+      type: DataTypes.TEXT,
+      allowNull: false
+    }
+  }, {
+    tableName: 'slogans',
+    timestamps: true,
+    indexes: [
+      { fields: ['appId'] },
+      { fields: ['appId', 'createdAt'] },
+      { unique: true, fields: ['appId', 'hi'] }
+    ]
+  });
+
   // Associations - explicit constraint names to avoid conflicts on shared hosting
   User.hasMany(Activity, { foreignKey: 'userId', constraints: false });
   Activity.belongsTo(User, { foreignKey: 'userId', constraints: false });
@@ -165,13 +207,14 @@ async function initModels(sequelize) {
   // Use alter: true for migrations (can be slow/buggy with SQLite)
   // Use no options for just creating missing tables
   await sequelize.sync({ alter: true });
+  await seedDefaultSlogans(Slogan);
   console.log('✅ SQL Models Synchronized');
 
-  return { User, Activity, DailySummary };
+  return { User, Activity, DailySummary, Slogan };
 }
 
 function getModels() {
-  return { User, Activity, DailySummary };
+  return { User, Activity, DailySummary, Slogan };
 }
 
 module.exports = { initModels, getModels };

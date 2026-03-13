@@ -415,4 +415,69 @@ router.get('/apps', authMiddleware, adminMiddleware, async (req, res) => {
   }
 });
 
+// Get slogans for an app
+router.get('/slogans', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { Slogan } = getModels();
+    const appId = req.query.appId || 'ram-bank';
+
+    let slogans;
+    if (dbFactory.isMongoDB()) {
+      slogans = await Slogan.find({ appId }).sort({ createdAt: -1 });
+    } else {
+      slogans = await Slogan.findAll({
+        where: { appId },
+        order: [['createdAt', 'DESC']],
+      });
+    }
+
+    res.json({ success: true, slogans });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Add slogan for an app
+router.post('/slogans', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { Slogan } = getModels();
+    const appId = req.body.appId || 'ram-bank';
+    const hi = String(req.body.hi || '').trim();
+    const en = String(req.body.en || '').trim();
+
+    if (!hi || !en) {
+      return res.status(400).json({ success: false, message: 'Both Hindi and English slogans are required' });
+    }
+
+    if (dbFactory.isMongoDB()) {
+      await Slogan.findOneAndUpdate(
+        { appId, hi },
+        { $set: { en }, $setOnInsert: { appId, hi } },
+        { upsert: true, new: true }
+      );
+      const slogans = await Slogan.find({ appId }).sort({ createdAt: -1 });
+      return res.json({ success: true, slogans });
+    }
+
+    const [slogan] = await Slogan.findOrCreate({
+      where: { appId, hi },
+      defaults: { appId, hi, en },
+    });
+
+    if (slogan.en !== en) {
+      slogan.en = en;
+      await slogan.save();
+    }
+
+    const slogans = await Slogan.findAll({
+      where: { appId },
+      order: [['createdAt', 'DESC']],
+    });
+
+    res.json({ success: true, slogans });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;

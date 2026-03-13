@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const defaultSlogans = require('../config/defaultSlogans');
 
 const userSchema = new mongoose.Schema({
   name: {
@@ -106,8 +107,44 @@ const dailySummarySchema = new mongoose.Schema({
 
 dailySummarySchema.index({ userId: 1, date: 1 }, { unique: true });
 
+const sloganSchema = new mongoose.Schema({
+  appId: {
+    type: String,
+    required: true,
+    default: 'ram-bank',
+    index: true
+  },
+  hi: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  en: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+sloganSchema.index({ appId: 1, hi: 1 }, { unique: true });
+
 const User = mongoose.model('User', userSchema);
 const Activity = mongoose.model('Activity', activitySchema);
 const DailySummary = mongoose.model('DailySummary', dailySummarySchema);
+const Slogan = mongoose.models.Slogan || mongoose.model('Slogan', sloganSchema);
 
-module.exports = { User, Activity, DailySummary };
+for (const [appId, slogans] of Object.entries(defaultSlogans)) {
+  for (const slogan of slogans) {
+    Slogan.findOneAndUpdate(
+      { appId, hi: slogan.hi },
+      { $setOnInsert: { appId, hi: slogan.hi, en: slogan.en } },
+      { upsert: true, new: false }
+    ).catch(() => {});
+  }
+}
+
+module.exports = { User, Activity, DailySummary, Slogan };

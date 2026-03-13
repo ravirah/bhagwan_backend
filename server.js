@@ -44,6 +44,7 @@ async function initializeDatabase() {
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/activities', require('./routes/activities'));
+app.use('/api/slogans', require('./routes/slogans'));
 app.use('/api/admin', require('./routes/admin'));
 
 // Health Check - use /api prefix for consistency

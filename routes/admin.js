@@ -480,4 +480,87 @@ router.post('/slogans', authMiddleware, adminMiddleware, async (req, res) => {
   }
 });
 
+// Update slogan
+router.put('/slogans/:sloganId', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { Slogan } = getModels();
+    const sloganId = req.params.sloganId;
+    const appId = req.body.appId || 'ram-bank';
+    const hi = String(req.body.hi || '').trim();
+    const en = String(req.body.en || '').trim();
+
+    if (!hi || !en) {
+      return res.status(400).json({ success: false, message: 'Both Hindi and English slogans are required' });
+    }
+
+    if (dbFactory.isMongoDB()) {
+      const slogan = await Slogan.findOneAndUpdate(
+        { _id: sloganId, appId },
+        { $set: { hi, en } },
+        { new: true }
+      );
+
+      if (!slogan) {
+        return res.status(404).json({ success: false, message: 'Slogan not found' });
+      }
+
+      const slogans = await Slogan.find({ appId }).sort({ createdAt: -1 });
+      return res.json({ success: true, slogans });
+    }
+
+    const slogan = await Slogan.findByPk(sloganId);
+    if (!slogan || slogan.appId !== appId) {
+      return res.status(404).json({ success: false, message: 'Slogan not found' });
+    }
+
+    slogan.hi = hi;
+    slogan.en = en;
+    await slogan.save();
+
+    const slogans = await Slogan.findAll({
+      where: { appId },
+      order: [['createdAt', 'DESC']],
+    });
+
+    res.json({ success: true, slogans });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Delete slogan
+router.delete('/slogans/:sloganId', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { Slogan } = getModels();
+    const sloganId = req.params.sloganId;
+    const appId = req.query.appId || 'ram-bank';
+
+    if (dbFactory.isMongoDB()) {
+      const slogan = await Slogan.findOneAndDelete({ _id: sloganId, appId });
+      if (!slogan) {
+        return res.status(404).json({ success: false, message: 'Slogan not found' });
+      }
+
+      const slogans = await Slogan.find({ appId }).sort({ createdAt: -1 });
+      return res.json({ success: true, slogans });
+    }
+
+    const slogan = await Slogan.findByPk(sloganId);
+    if (!slogan || slogan.appId !== appId) {
+      return res.status(404).json({ success: false, message: 'Slogan not found' });
+    }
+
+    await slogan.destroy();
+
+    const slogans = await Slogan.findAll({
+      where: { appId },
+      order: [['createdAt', 'DESC']],
+    });
+
+    res.json({ success: true, slogans });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;

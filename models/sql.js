@@ -12,6 +12,35 @@ async function seedDefaultSlogans(SloganModel) {
   }
 }
 
+function getSyncMode() {
+  const configured = String(process.env.DB_SYNC_MODE || '').trim().toLowerCase();
+  if (configured) return configured;
+  return process.env.NODE_ENV === 'production' ? 'safe' : 'alter';
+}
+
+async function syncDatabase(sequelize) {
+  const syncMode = getSyncMode();
+
+  switch (syncMode) {
+    case 'off':
+    case 'none':
+      console.log('ℹ️ Skipping sequelize.sync() because DB_SYNC_MODE is disabled');
+      return;
+    case 'force':
+      await sequelize.sync({ force: true });
+      console.log('⚠️ SQL Models synchronized with force mode');
+      return;
+    case 'alter':
+      await sequelize.sync({ alter: true });
+      console.log('✅ SQL Models synchronized with alter mode');
+      return;
+    case 'safe':
+    default:
+      await sequelize.sync();
+      console.log(`✅ SQL Models synchronized with ${syncMode === 'safe' ? 'safe' : syncMode} mode`);
+      return;
+  }
+}
 
 /**
  * MULTI-APP ARCHITECTURE
@@ -75,7 +104,7 @@ async function initModels(sequelize) {
       { fields: ['email'] },
       { fields: ['mobile'] },
       { fields: ['appId'] },
-      { fields: ['appId', 'mobile'], unique: true } // Unique mobile per app
+      { fields: ['appId', 'mobile'], unique: true }
     ]
   });
 
@@ -195,20 +224,14 @@ async function initModels(sequelize) {
     ]
   });
 
-  // Associations - explicit constraint names to avoid conflicts on shared hosting
   User.hasMany(Activity, { foreignKey: 'userId', constraints: false });
   Activity.belongsTo(User, { foreignKey: 'userId', constraints: false });
 
   User.hasMany(DailySummary, { foreignKey: 'userId', constraints: false });
   DailySummary.belongsTo(User, { foreignKey: 'userId', constraints: false });
 
-  // Sync database
-  // Use force: true for fresh database (WARNING: deletes existing data)
-  // Use alter: true for migrations (can be slow/buggy with SQLite)
-  // Use no options for just creating missing tables
-  await sequelize.sync({ alter: true });
+  await syncDatabase(sequelize);
   await seedDefaultSlogans(Slogan);
-  console.log('✅ SQL Models Synchronized');
 
   return { User, Activity, DailySummary, Slogan };
 }

@@ -99,6 +99,18 @@ const dailySummarySchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  firstCountAt: {
+    type: Date,
+    default: null
+  },
+  lastCountAt: {
+    type: Date,
+    default: null
+  },
+  activeDurationSeconds: {
+    type: Number,
+    default: 0
+  },
   createdAt: {
     type: Date,
     default: Date.now
@@ -148,3 +160,6 @@ for (const [appId, slogans] of Object.entries(defaultSlogans)) {
 }
 
 module.exports = { User, Activity, DailySummary, Slogan };
+
+
+

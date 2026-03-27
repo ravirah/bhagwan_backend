@@ -180,6 +180,18 @@ async function initModels(sequelize) {
     streak: {
       type: DataTypes.INTEGER,
       defaultValue: 0
+    },
+    firstCountAt: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    lastCountAt: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    activeDurationSeconds: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0
     }
   }, {
     tableName: 'dailysummaries',
@@ -241,3 +253,4 @@ function getModels() {
 }
 
 module.exports = { initModels, getModels };
+

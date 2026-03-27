@@ -5,67 +5,95 @@ const getModels = require('../models');
 const dbFactory = require('../config/database');
 const moment = require('moment');
 
+function getActiveDurationSeconds(firstCountAt, lastCountAt) {
+  if (!firstCountAt || !lastCountAt) return 0;
+  const start = moment(firstCountAt);
+  const end = moment(lastCountAt);
+  if (!start.isValid() || !end.isValid()) return 0;
+  return Math.max(0, end.diff(start, 'seconds'));
+}
+
 // Add count activity
 router.post('/add-count', authMiddleware, async (req, res) => {
   try {
     const { User, Activity, DailySummary } = getModels();
     const { count = 1 } = req.body;
-    const today = moment().format('YYYY-MM-DD');
+    const now = new Date();
+    const today = moment(now).format('YYYY-MM-DD');
 
-    // Update user total count
     let user;
     if (dbFactory.isMongoDB()) {
       user = await User.findByIdAndUpdate(
         req.user.userId,
-        { 
+        {
           $inc: { totalCount: count },
-          lastActiveDate: new Date()
+          lastActiveDate: now
         },
         { new: true }
       );
     } else {
       user = await User.findByPk(req.user.userId);
       user.totalCount += count;
-      user.lastActiveDate = new Date();
+      user.lastActiveDate = now;
       await user.save();
     }
 
-    // Log activity
     await Activity.create({
       userId: req.user.userId,
       appId: user.appId,
       activityType: 'COUNT_INCREMENT',
       count,
-      timestamp: new Date()
+      timestamp: now
     });
 
-    // Update daily summary
+    let summary;
     if (dbFactory.isMongoDB()) {
-      await DailySummary.findOneAndUpdate(
+      summary = await DailySummary.findOneAndUpdate(
         { userId: req.user.userId, date: today },
-        { 
+        {
           $inc: { dailyCount: count },
-          $set: { 
+          $set: {
             totalCount: user.totalCount,
-            appId: user.appId
-          }
+            appId: user.appId,
+            lastCountAt: now
+          },
+          $setOnInsert: {
+            userId: req.user.userId,
+            date: today,
+            firstCountAt: now,
+            createdAt: now
+          },
+          $min: { firstCountAt: now },
+          $max: { lastCountAt: now }
         },
         { upsert: true, new: true }
       );
+
+      summary.activeDurationSeconds = getActiveDurationSeconds(summary.firstCountAt, summary.lastCountAt);
+      await summary.save();
     } else {
-      const [summary, created] = await DailySummary.findOrCreate({
+      const [foundSummary, created] = await DailySummary.findOrCreate({
         where: { userId: req.user.userId, date: today },
-        defaults: { 
+        defaults: {
           userId: req.user.userId,
           appId: user.appId,
           date: today,
           dailyCount: count,
-          totalCount: user.totalCount
+          totalCount: user.totalCount,
+          firstCountAt: now,
+          lastCountAt: now,
+          activeDurationSeconds: 0
         }
       });
+
+      summary = foundSummary;
       if (!created) {
         summary.dailyCount += count;
         summary.totalCount = user.totalCount;
+        summary.appId = user.appId;
+        summary.firstCountAt = summary.firstCountAt && new Date(summary.firstCountAt) < now ? summary.firstCountAt : now;
+        summary.lastCountAt = now;
+        summary.activeDurationSeconds = getActiveDurationSeconds(summary.firstCountAt, summary.lastCountAt);
         await summary.save();
       }
     }
@@ -73,13 +101,17 @@ router.post('/add-count', authMiddleware, async (req, res) => {
     res.json({
       success: true,
       totalCount: user.totalCount,
+      todayCount: summary?.dailyCount || 0,
+      firstCountAt: summary?.firstCountAt || null,
+      lastCountAt: summary?.lastCountAt || null,
+      activeDurationSeconds: summary?.activeDurationSeconds || 0,
       message: 'Count updated successfully'
     });
   } catch (error) {
     console.error('Add count error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
+    res.status(500).json({
+      success: false,
+      message: error.message
     });
   }
 });
@@ -111,9 +143,9 @@ router.get('/my-activities', authMiddleware, async (req, res) => {
       activities
     });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
+    res.status(500).json({
+      success: false,
+      message: error.message
     });
   }
 });
@@ -142,9 +174,9 @@ router.get('/daily-summary', authMiddleware, async (req, res) => {
       summaries
     });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
+    res.status(500).json({
+      success: false,
+      message: error.message
     });
   }
 });

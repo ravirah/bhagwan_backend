@@ -563,4 +563,158 @@ router.delete('/slogans/:sloganId', authMiddleware, adminMiddleware, async (req,
   }
 });
 
+// Chant summary report (weekly / monthly / yearly) — aggregates DailySummary by period
+router.get('/reports/chant-summary', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User, DailySummary } = getModels();
+    const {
+      type = 'weekly',
+      periodStart,
+      periodEnd,
+      appId,
+      userId,
+      bucket = 'day',
+    } = req.query;
+
+    if (!periodStart || !periodEnd) {
+      return res.status(400).json({ success: false, message: 'periodStart and periodEnd are required (YYYY-MM-DD)' });
+    }
+    const start = moment(periodStart, 'YYYY-MM-DD', true);
+    const end = moment(periodEnd, 'YYYY-MM-DD', true);
+    if (!start.isValid() || !end.isValid() || end.isBefore(start)) {
+      return res.status(400).json({ success: false, message: 'Invalid period range' });
+    }
+    const normalizedType = ['weekly', 'monthly', 'yearly'].includes(type) ? type : 'weekly';
+    const normalizedBucket = ['day', 'week', 'month'].includes(bucket) ? bucket : 'day';
+
+    const bucketLabel = (dateStr) => {
+      const m = moment(dateStr, 'YYYY-MM-DD');
+      if (!m.isValid()) return dateStr;
+      if (normalizedBucket === 'day') return m.format('YYYY-MM-DD');
+      if (normalizedBucket === 'week') return `${m.isoWeekYear()}-W${String(m.isoWeek()).padStart(2, '0')}`;
+      return m.format('YYYY-MM');
+    };
+
+    const startStr = start.format('YYYY-MM-DD');
+    const endStr = end.format('YYYY-MM-DD');
+
+    let rows = [];
+    let totalCount = 0;
+    let activeUsersSet = new Set();
+
+    if (dbFactory.isMongoDB()) {
+      const userMatch = { ...(appId && { appId }) };
+      const allUsers = userId
+        ? await User.find({ _id: userId, ...(appId && { appId }) })
+        : await User.find(userMatch);
+
+      const summaryMatch = {
+        date: { $gte: startStr, $lte: endStr },
+      };
+      if (userId) summaryMatch.userId = userId;
+
+      const summaries = await DailySummary.find(summaryMatch);
+
+      const byUser = new Map();
+      summaries.forEach((s) => {
+        const uid = String(s.userId);
+        const count = Number(s.dailyCount || 0);
+        if (!byUser.has(uid)) byUser.set(uid, { total: 0, buckets: new Map() });
+        const entry = byUser.get(uid);
+        entry.total += count;
+        const label = bucketLabel(s.date);
+        entry.buckets.set(label, (entry.buckets.get(label) || 0) + count);
+        if (count > 0) activeUsersSet.add(uid);
+      });
+
+      rows = allUsers
+        .filter((u) => !appId || u.appId === appId)
+        .map((u) => {
+          const uid = String(u._id);
+          const entry = byUser.get(uid) || { total: 0, buckets: new Map() };
+          const buckets = Array.from(entry.buckets.entries())
+            .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+            .map(([label, count]) => ({ label, count }));
+          totalCount += entry.total;
+          return {
+            userId: uid,
+            name: u.name || '',
+            mobile: u.mobile || '',
+            email: u.email || '',
+            status: u.status || 'pending',
+            appId: u.appId || null,
+            registeredDate: u.createdAt || null,
+            totalCount: entry.total,
+            buckets,
+          };
+        })
+        .filter((r) => (userId ? true : r.totalCount > 0 || !userId));
+    } else {
+      const userWhere = { ...(appId && { appId }) };
+      if (userId) userWhere.id = userId;
+      const allUsers = await User.findAll({ where: userWhere });
+
+      const summaryWhere = { date: { [Op.between]: [startStr, endStr] } };
+      if (userId) summaryWhere.userId = userId;
+      const summaries = await DailySummary.findAll({ where: summaryWhere });
+
+      const byUser = new Map();
+      summaries.forEach((s) => {
+        const uid = String(s.userId);
+        const count = Number(s.dailyCount || 0);
+        if (!byUser.has(uid)) byUser.set(uid, { total: 0, buckets: new Map() });
+        const entry = byUser.get(uid);
+        entry.total += count;
+        const label = bucketLabel(s.date);
+        entry.buckets.set(label, (entry.buckets.get(label) || 0) + count);
+        if (count > 0) activeUsersSet.add(uid);
+      });
+
+      rows = allUsers.map((u) => {
+        const uid = String(u.id);
+        const entry = byUser.get(uid) || { total: 0, buckets: new Map() };
+        const buckets = Array.from(entry.buckets.entries())
+          .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+          .map(([label, count]) => ({ label, count }));
+        totalCount += entry.total;
+        return {
+          userId: uid,
+          name: u.name || '',
+          mobile: u.mobile || '',
+          email: u.email || '',
+          status: u.status || 'pending',
+          appId: u.appId || null,
+          registeredDate: u.createdAt || null,
+          totalCount: entry.total,
+          buckets,
+        };
+      });
+    }
+
+    rows.sort((a, b) => b.totalCount - a.totalCount);
+
+    res.json({
+      success: true,
+      meta: {
+        type: normalizedType,
+        bucket: normalizedBucket,
+        periodStart: startStr,
+        periodEnd: endStr,
+        appId: appId || null,
+        scope: userId ? 'single' : 'all',
+        generatedAt: new Date().toISOString(),
+      },
+      totals: {
+        totalUsers: rows.length,
+        totalCount,
+        activeUsers: activeUsersSet.size,
+      },
+      rows,
+    });
+  } catch (error) {
+    console.error('🔴 Error generating chant summary report:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;

@@ -574,6 +574,7 @@ router.get('/reports/chant-summary', authMiddleware, adminMiddleware, async (req
       appId,
       userId,
       bucket = 'day',
+      topN: topNRaw,
     } = req.query;
 
     if (!periodStart || !periodEnd) {
@@ -586,6 +587,9 @@ router.get('/reports/chant-summary', authMiddleware, adminMiddleware, async (req
     }
     const normalizedType = ['weekly', 'monthly', 'yearly'].includes(type) ? type : 'weekly';
     const normalizedBucket = ['day', 'week', 'month'].includes(bucket) ? bucket : 'day';
+    // topN: integer >= 1 caps the response to top-N rows by totalCount; 0 / missing means no cap.
+    const parsedTopN = parseInt(topNRaw, 10);
+    const topN = Number.isFinite(parsedTopN) && parsedTopN > 0 ? parsedTopN : 0;
 
     const bucketLabel = (dateStr) => {
       const m = moment(dateStr, 'YYYY-MM-DD');
@@ -648,7 +652,9 @@ router.get('/reports/chant-summary', authMiddleware, adminMiddleware, async (req
             buckets,
           };
         })
-        .filter((r) => (userId ? true : r.totalCount > 0 || !userId));
+        // In single-user mode keep the row even if zero (admin explicitly picked them);
+        // otherwise drop zero-count users so the payload only carries meaningful rows.
+        .filter((r) => (userId ? true : r.totalCount > 0));
     } else {
       const userWhere = { ...(appId && { appId }) };
       if (userId) userWhere.id = userId;
@@ -670,28 +676,33 @@ router.get('/reports/chant-summary', authMiddleware, adminMiddleware, async (req
         if (count > 0) activeUsersSet.add(uid);
       });
 
-      rows = allUsers.map((u) => {
-        const uid = String(u.id);
-        const entry = byUser.get(uid) || { total: 0, buckets: new Map() };
-        const buckets = Array.from(entry.buckets.entries())
-          .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-          .map(([label, count]) => ({ label, count }));
-        totalCount += entry.total;
-        return {
-          userId: uid,
-          name: u.name || '',
-          mobile: u.mobile || '',
-          email: u.email || '',
-          status: u.status || 'pending',
-          appId: u.appId || null,
-          registeredDate: u.createdAt || null,
-          totalCount: entry.total,
-          buckets,
-        };
-      });
+      rows = allUsers
+        .map((u) => {
+          const uid = String(u.id);
+          const entry = byUser.get(uid) || { total: 0, buckets: new Map() };
+          const buckets = Array.from(entry.buckets.entries())
+            .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+            .map(([label, count]) => ({ label, count }));
+          totalCount += entry.total;
+          return {
+            userId: uid,
+            name: u.name || '',
+            mobile: u.mobile || '',
+            email: u.email || '',
+            status: u.status || 'pending',
+            appId: u.appId || null,
+            registeredDate: u.createdAt || null,
+            totalCount: entry.total,
+            buckets,
+          };
+        })
+        .filter((r) => (userId ? true : r.totalCount > 0));
     }
 
     rows.sort((a, b) => b.totalCount - a.totalCount);
+
+    const fullRowCount = rows.length;
+    const limitedRows = topN > 0 ? rows.slice(0, topN) : rows;
 
     res.json({
       success: true,
@@ -705,11 +716,12 @@ router.get('/reports/chant-summary', authMiddleware, adminMiddleware, async (req
         generatedAt: new Date().toISOString(),
       },
       totals: {
-        totalUsers: rows.length,
+        totalUsers: fullRowCount,
         totalCount,
         activeUsers: activeUsersSet.size,
+        truncatedRows: fullRowCount - limitedRows.length,
       },
-      rows,
+      rows: limitedRows,
     });
   } catch (error) {
     console.error('🔴 Error generating chant summary report:', error);

@@ -33,9 +33,14 @@ router.post('/add-count', authMiddleware, async (req, res) => {
       );
     } else {
       user = await User.findByPk(req.user.userId);
-      user.totalCount += count;
+      // Atomic DB-level increment (UPDATE ... SET totalCount = totalCount + count) so
+      // concurrent requests can't read the same value and clobber each other.
+      await user.increment({ totalCount: count });
       user.lastActiveDate = now;
-      await user.save();
+      // Persist only the timestamp — re-saving the whole instance would write back a
+      // stale in-memory totalCount and undo the atomic increment above.
+      await user.save({ fields: ['lastActiveDate'] });
+      await user.reload();
     }
 
     await Activity.create({
@@ -88,13 +93,17 @@ router.post('/add-count', authMiddleware, async (req, res) => {
 
       summary = foundSummary;
       if (!created) {
-        summary.dailyCount += count;
+        // Atomic DB-level increment of the daily counter.
+        await summary.increment({ dailyCount: count });
+        const newFirstCountAt = summary.firstCountAt && new Date(summary.firstCountAt) < now ? summary.firstCountAt : now;
         summary.totalCount = user.totalCount;
         summary.appId = user.appId;
-        summary.firstCountAt = summary.firstCountAt && new Date(summary.firstCountAt) < now ? summary.firstCountAt : now;
+        summary.firstCountAt = newFirstCountAt;
         summary.lastCountAt = now;
-        summary.activeDurationSeconds = getActiveDurationSeconds(summary.firstCountAt, summary.lastCountAt);
-        await summary.save();
+        summary.activeDurationSeconds = getActiveDurationSeconds(newFirstCountAt, now);
+        // Save only the metadata fields; dailyCount is owned by the atomic increment above.
+        await summary.save({ fields: ['totalCount', 'appId', 'firstCountAt', 'lastCountAt', 'activeDurationSeconds'] });
+        await summary.reload();
       }
     }
 

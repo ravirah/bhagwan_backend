@@ -125,28 +125,77 @@ router.put('/users/:userId', authMiddleware, adminMiddleware, async (req, res) =
   }
 });
 
-// Delete user and all their data
+// Deactivate a user (data-safe "delete"). We NEVER hard-delete the user or destroy their
+// activity ledger / daily summaries — that is what permanently lost Sunil's 15,002 count.
+// Instead we mark the account 'rejected' (which blocks login) while keeping every row, so
+// the count is fully recoverable: an admin can re-approve and the totalCount is intact.
 router.delete('/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { User, Activity, DailySummary } = getModels();
+    const { User } = getModels();
     const { userId } = req.params;
 
     let user;
     if (dbFactory.isMongoDB()) {
       user = await User.findById(userId);
       if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-      await Activity.deleteMany({ userId });
-      await DailySummary.deleteMany({ userId });
-      await User.findByIdAndDelete(userId);
+      user = await User.findByIdAndUpdate(userId, { status: 'rejected' }, { new: true });
     } else {
       user = await User.findByPk(userId);
       if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-      await Activity.destroy({ where: { userId } });
-      await DailySummary.destroy({ where: { userId } });
-      await User.destroy({ where: { id: userId } });
+      await User.update({ status: 'rejected' }, { where: { id: userId } });
+      user = await User.findByPk(userId);
     }
 
-    res.json({ success: true, message: 'User deleted successfully' });
+    res.json({
+      success: true,
+      message: 'User deactivated. Their count and history are preserved — re-approve to restore.',
+      user,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Restore every user's totalCount from the immutable activity ledger (never lowers it).
+// One-shot repair tool to heal any account whose cached count drifted below its real
+// history — e.g. after the old destructive bugs. Safe to run repeatedly.
+router.post('/reconcile-counts', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User, Activity } = getModels();
+    const results = { checked: 0, restored: 0, details: [] };
+
+    if (dbFactory.isMongoDB()) {
+      const users = await User.find({});
+      for (const u of users) {
+        results.checked += 1;
+        const agg = await Activity.aggregate([
+          { $match: { userId: u._id, activityType: 'COUNT_INCREMENT' } },
+          { $group: { _id: null, total: { $sum: '$count' } } },
+        ]);
+        const ledger = (agg && agg[0] && agg[0].total) || 0;
+        if (ledger > Number(u.totalCount || 0)) {
+          results.details.push({ id: u._id, mobile: u.mobile, from: u.totalCount, to: ledger });
+          u.totalCount = ledger;
+          await u.save();
+          results.restored += 1;
+        }
+      }
+    } else {
+      const users = await User.findAll();
+      for (const u of users) {
+        results.checked += 1;
+        const ledger = (await Activity.sum('count', {
+          where: { userId: u.id, activityType: 'COUNT_INCREMENT' },
+        })) || 0;
+        if (ledger > Number(u.totalCount || 0)) {
+          results.details.push({ id: u.id, mobile: u.mobile, from: u.totalCount, to: ledger });
+          await User.update({ totalCount: ledger }, { where: { id: u.id } });
+          results.restored += 1;
+        }
+      }
+    }
+
+    res.json({ success: true, ...results });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

@@ -227,6 +227,79 @@ router.post('/reconcile-counts', authMiddleware, adminMiddleware, async (req, re
   }
 });
 
+// Forensic: find ORPHANED activity/summary rows — those whose userId no longer exists in
+// the users table (i.e. the user was deleted but their history survived). Their
+// COUNT_INCREMENT sum / totalCount snapshot reveals a deleted account's userId and count.
+// Read-only. Optional ?appId= and ?minCount= filters to narrow the candidates.
+router.get('/orphans', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User } = getModels();
+    const appId = req.query.appId ? String(req.query.appId).trim() : null;
+    const minCount = Number(req.query.minCount) || 0;
+
+    if (dbFactory.isMongoDB()) {
+      const { Activity, DailySummary } = getModels();
+      const userIds = (await User.find({}, { _id: 1 })).map((u) => String(u._id));
+      const idSet = new Set(userIds);
+      const acts = await Activity.aggregate([
+        { $group: { _id: { userId: '$userId', appId: '$appId' },
+          activityRows: { $sum: 1 },
+          ledgerSum: { $sum: { $cond: [{ $eq: ['$activityType', 'COUNT_INCREMENT'] }, '$count', 0] } },
+          firstAt: { $min: '$timestamp' }, lastAt: { $max: '$timestamp' } } },
+      ]);
+      const orphanActivities = acts
+        .filter((a) => !idSet.has(String(a._id.userId)))
+        .map((a) => ({ userId: a._id.userId, appId: a._id.appId, activityRows: a.activityRows, ledgerSum: a.ledgerSum, firstAt: a.firstAt, lastAt: a.lastAt }))
+        .filter((a) => (!appId || a.appId === appId) && a.ledgerSum >= minCount)
+        .sort((x, y) => y.ledgerSum - x.ledgerSum);
+      return res.json({ success: true, db: 'mongodb', orphanActivities, orphanSummaries: [] });
+    }
+
+    const sequelize = User.sequelize;
+    const orphanActivities = await sequelize.query(
+      `SELECT a.userId, a.appId,
+              COUNT(*) AS activityRows,
+              COALESCE(SUM(CASE WHEN a.activityType='COUNT_INCREMENT' THEN a.count ELSE 0 END),0) AS ledgerSum,
+              MIN(a.timestamp) AS firstAt, MAX(a.timestamp) AS lastAt
+       FROM activities a
+       LEFT JOIN users u ON u.id = a.userId
+       WHERE u.id IS NULL
+       GROUP BY a.userId, a.appId
+       HAVING ledgerSum >= :minCount
+       ORDER BY ledgerSum DESC`,
+      { type: QueryTypes.SELECT, replacements: { minCount } }
+    );
+    const orphanSummaries = await sequelize.query(
+      `SELECT s.userId, s.appId,
+              COUNT(*) AS dayRows,
+              MAX(s.totalCount) AS maxTotalSnapshot, MAX(s.dailyCount) AS bestDay,
+              MIN(s.date) AS firstDate, MAX(s.date) AS lastDate
+       FROM dailysummaries s
+       LEFT JOIN users u ON u.id = s.userId
+       WHERE u.id IS NULL
+       GROUP BY s.userId, s.appId
+       HAVING maxTotalSnapshot >= :minCount
+       ORDER BY maxTotalSnapshot DESC`,
+      { type: QueryTypes.SELECT, replacements: { minCount } }
+    );
+    // Also report the id range + existing ids so a deletion GAP is visible.
+    const idRows = await sequelize.query('SELECT id FROM users ORDER BY id', { type: QueryTypes.SELECT });
+    const ids = idRows.map((r) => r.id);
+
+    res.json({
+      success: true,
+      db: 'mysql',
+      filters: { appId, minCount },
+      orphanActivities: appId ? orphanActivities.filter((o) => o.appId === appId) : orphanActivities,
+      orphanSummaries: appId ? orphanSummaries.filter((o) => o.appId === appId) : orphanSummaries,
+      existingUserIds: ids,
+      note: 'orphan* rows belong to deleted users. A high ledgerSum/maxTotalSnapshot near 15,002 in appId ram-bank, ending ~late May, is likely Sunil.',
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // View the admin audit trail (who did what, when). Newest first.
 router.get('/audit-logs', authMiddleware, adminMiddleware, async (req, res) => {
   try {

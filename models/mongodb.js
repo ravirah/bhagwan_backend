@@ -144,10 +144,21 @@ const sloganSchema = new mongoose.Schema({
 
 sloganSchema.index({ appId: 1, hi: 1 }, { unique: true });
 
+const auditLogSchema = new mongoose.Schema({
+  adminUser: { type: String, default: null },
+  action: { type: String, required: true, index: true },
+  targetUserId: { type: String, default: null, index: true },
+  targetMobile: { type: String, default: null },
+  details: { type: mongoose.Schema.Types.Mixed, default: {} },
+  ipAddress: { type: String, default: null },
+  createdAt: { type: Date, default: Date.now, index: true },
+});
+
 const User = mongoose.model('User', userSchema);
 const Activity = mongoose.model('Activity', activitySchema);
 const DailySummary = mongoose.model('DailySummary', dailySummarySchema);
 const Slogan = mongoose.models.Slogan || mongoose.model('Slogan', sloganSchema);
+const AuditLog = mongoose.models.AuditLog || mongoose.model('AuditLog', auditLogSchema);
 
 for (const [appId, slogans] of Object.entries(defaultSlogans)) {
   for (const slogan of slogans) {
@@ -159,7 +170,7 @@ for (const [appId, slogans] of Object.entries(defaultSlogans)) {
   }
 }
 
-module.exports = { User, Activity, DailySummary, Slogan };
+module.exports = { User, Activity, DailySummary, Slogan, AuditLog };
 
 
 

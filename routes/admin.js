@@ -6,6 +6,28 @@ const dbFactory = require('../config/database');
 const moment = require('moment');
 const { Op, QueryTypes } = require('sequelize');
 
+// Append-only audit trail of admin actions: who (admin username), what (action),
+// on whom (target user/mobile), from where (IP), and when. Never throws into the
+// caller — auditing must not block the action it records.
+async function logAdminAction(req, action, { targetUserId = null, targetMobile = null, details = {} } = {}) {
+  try {
+    const { AuditLog } = getModels();
+    if (!AuditLog) return;
+    const adminUser = (req.user && (req.user.username || req.user.name)) || 'unknown-admin';
+    const ipAddress = (req.headers && req.headers['x-forwarded-for']) || req.ip || null;
+    const payload = { adminUser, action, targetUserId: targetUserId == null ? null : String(targetUserId), targetMobile, details, ipAddress };
+    if (dbFactory.isMongoDB()) {
+      await AuditLog.create(payload);
+    } else {
+      // SQL targetUserId column is INTEGER; coerce or null.
+      const numericTarget = Number(targetUserId);
+      await AuditLog.create({ ...payload, targetUserId: Number.isFinite(numericTarget) ? numericTarget : null });
+    }
+  } catch (e) {
+    console.error('audit log error:', e.message);
+  }
+}
+
 // Get all users
 router.get('/users', authMiddleware, adminMiddleware, async (req, res) => {
   try {
@@ -89,6 +111,7 @@ router.put('/users/:userId/status', authMiddleware, adminMiddleware, async (req,
       activityType,
       metadata: { updatedBy: 'admin', timestamp: new Date() }
     });
+    await logAdminAction(req, 'STATUS_CHANGE', { targetUserId: user._id || user.id, targetMobile: user.mobile, details: { status } });
 
     res.json({ success: true, user });
   } catch (error) {
@@ -119,6 +142,7 @@ router.put('/users/:userId', authMiddleware, adminMiddleware, async (req, res) =
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
+    await logAdminAction(req, 'EDIT_USER', { targetUserId: user._id || user.id, targetMobile: user.mobile, details: { name, mobile, email } });
     res.json({ success: true, user });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -146,6 +170,7 @@ router.delete('/users/:userId', authMiddleware, adminMiddleware, async (req, res
       user = await User.findByPk(userId);
     }
 
+    await logAdminAction(req, 'DEACTIVATE_USER', { targetUserId: user._id || user.id, targetMobile: user.mobile, details: { previousStatus: 'see history' } });
     res.json({
       success: true,
       message: 'User deactivated. Their count and history are preserved — re-approve to restore.',
@@ -195,7 +220,93 @@ router.post('/reconcile-counts', authMiddleware, adminMiddleware, async (req, re
       }
     }
 
+    await logAdminAction(req, 'RECONCILE_COUNTS', { details: { checked: results.checked, restored: results.restored } });
     res.json({ success: true, ...results });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// View the admin audit trail (who did what, when). Newest first.
+router.get('/audit-logs', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { AuditLog } = getModels();
+    const limit = Math.min(500, parseInt(req.query.limit, 10) || 100);
+    let logs = [];
+    if (dbFactory.isMongoDB()) {
+      logs = await AuditLog.find({}).sort({ createdAt: -1 }).limit(limit);
+    } else {
+      logs = await AuditLog.findAll({ order: [['createdAt', 'DESC']], limit });
+    }
+    res.json({ success: true, logs });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Diagnose a user by mobile: returns EVERY matching user row (to reveal duplicates) plus
+// each one's activity/summary counts. Settles "was this user deleted, or did a duplicate
+// 0-count row get created?" — read-only, no side effects.
+router.get('/diagnose-user', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User, Activity, DailySummary, AuditLog } = getModels();
+    const mobile = String(req.query.mobile == null ? '' : req.query.mobile).trim();
+    if (!mobile) return res.status(400).json({ success: false, message: 'mobile query param required' });
+
+    let users = [];
+    if (dbFactory.isMongoDB()) {
+      users = await User.find({ mobile: { $regex: mobile, $options: 'i' } });
+    } else {
+      users = await User.findAll({ where: { mobile: { [Op.like]: `%${mobile}%` } } });
+    }
+
+    const report = [];
+    for (const u of users) {
+      const uid = u._id || u.id;
+      let ledger = 0, activityRows = 0, summaryRows = 0;
+      if (dbFactory.isMongoDB()) {
+        activityRows = await Activity.countDocuments({ userId: uid });
+        summaryRows = await DailySummary.countDocuments({ userId: uid });
+        const agg = await Activity.aggregate([
+          { $match: { userId: uid, activityType: 'COUNT_INCREMENT' } },
+          { $group: { _id: null, total: { $sum: '$count' } } },
+        ]);
+        ledger = (agg && agg[0] && agg[0].total) || 0;
+      } else {
+        activityRows = await Activity.count({ where: { userId: uid } });
+        summaryRows = await DailySummary.count({ where: { userId: uid } });
+        ledger = (await Activity.sum('count', { where: { userId: uid, activityType: 'COUNT_INCREMENT' } })) || 0;
+      }
+      report.push({
+        id: uid, name: u.name, mobile: u.mobile, appId: u.appId, status: u.status,
+        totalCount: u.totalCount, createdAt: u.createdAt,
+        activityRows, summaryRows, ledgerSum: ledger,
+      });
+    }
+
+    // Surface any audit entries that mention this mobile.
+    let relatedAudit = [];
+    try {
+      if (dbFactory.isMongoDB()) {
+        relatedAudit = await AuditLog.find({ targetMobile: { $regex: mobile, $options: 'i' } }).sort({ createdAt: -1 }).limit(50);
+      } else {
+        relatedAudit = await AuditLog.findAll({ where: { targetMobile: { [Op.like]: `%${mobile}%` } }, order: [['createdAt', 'DESC']], limit: 50 });
+      }
+    } catch (_) { /* audit table may be brand new/empty */ }
+
+    res.json({
+      success: true,
+      mobile,
+      matchingUsers: report,
+      interpretation: report.length > 1
+        ? 'Multiple rows for this mobile → duplicate created by a lookup miss (no human deletion).'
+        : (report.length === 1 && report[0].totalCount === 0 && report[0].ledgerSum > 0
+            ? 'Single row at 0 but ledger has counts → totalCount was reset; reconcile will restore it.'
+            : (report.length === 1
+                ? 'Single row. Compare totalCount vs ledgerSum to judge if a reset occurred.'
+                : 'No rows found — the user record was hard-deleted (recover from device or backup).')),
+      relatedAudit,
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

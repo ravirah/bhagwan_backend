@@ -54,7 +54,7 @@ async function syncDatabase(sequelize) {
  * Database has UNIQUE constraint on (appId, mobile) - same mobile can exist in different apps.
  */
 
-let User, Activity, DailySummary, Slogan;
+let User, Activity, DailySummary, Slogan, AuditLog;
 
 async function initModels(sequelize) {
   User = sequelize.define('User', {
@@ -236,6 +236,25 @@ async function initModels(sequelize) {
     ]
   });
 
+  // Permanent, append-only record of admin actions — answers "who did what, when".
+  AuditLog = sequelize.define('AuditLog', {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    adminUser: { type: DataTypes.STRING, allowNull: true },
+    action: { type: DataTypes.STRING, allowNull: false },
+    targetUserId: { type: DataTypes.INTEGER, allowNull: true },
+    targetMobile: { type: DataTypes.STRING, allowNull: true },
+    details: { type: DataTypes.JSON, defaultValue: {} },
+    ipAddress: { type: DataTypes.STRING, allowNull: true },
+  }, {
+    tableName: 'auditlogs',
+    timestamps: true,
+    indexes: [
+      { fields: ['action'] },
+      { fields: ['targetUserId'] },
+      { fields: ['createdAt'] },
+    ],
+  });
+
   User.hasMany(Activity, { foreignKey: 'userId', constraints: false });
   Activity.belongsTo(User, { foreignKey: 'userId', constraints: false });
 
@@ -245,11 +264,11 @@ async function initModels(sequelize) {
   await syncDatabase(sequelize);
   await seedDefaultSlogans(Slogan);
 
-  return { User, Activity, DailySummary, Slogan };
+  return { User, Activity, DailySummary, Slogan, AuditLog };
 }
 
 function getModels() {
-  return { User, Activity, DailySummary, Slogan };
+  return { User, Activity, DailySummary, Slogan, AuditLog };
 }
 
 module.exports = { initModels, getModels };

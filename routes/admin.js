@@ -300,6 +300,35 @@ router.get('/orphans', authMiddleware, adminMiddleware, async (req, res) => {
   }
 });
 
+// Audited manual count correction — restores a count lost outside the ledger (e.g.
+// recovered from a user's device after a destructive delete). Records old→new + reason.
+router.put('/users/:userId/set-count', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User } = getModels();
+    const { userId } = req.params;
+    const newTotal = Math.floor(Number(req.body.totalCount));
+    if (!Number.isFinite(newTotal) || newTotal < 0) {
+      return res.status(400).json({ success: false, message: 'totalCount must be a non-negative number' });
+    }
+    let user;
+    if (dbFactory.isMongoDB()) user = await User.findById(userId);
+    else user = await User.findByPk(userId);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const oldTotal = Number(user.totalCount || 0);
+    if (dbFactory.isMongoDB()) { user.totalCount = newTotal; await user.save(); }
+    else { await User.update({ totalCount: newTotal }, { where: { id: user.id } }); user = await User.findByPk(user.id); }
+
+    await logAdminAction(req, 'SET_COUNT', {
+      targetUserId: user._id || user.id, targetMobile: user.mobile,
+      details: { from: oldTotal, to: newTotal, reason: req.body.reason || null },
+    });
+    res.json({ success: true, user, from: oldTotal, to: newTotal });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // View the admin audit trail (who did what, when). Newest first.
 router.get('/audit-logs', authMiddleware, adminMiddleware, async (req, res) => {
   try {

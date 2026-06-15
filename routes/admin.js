@@ -991,4 +991,85 @@ router.get('/reports/chant-summary', authMiddleware, adminMiddleware, async (req
   }
 });
 
+// Server-side राम-repetition PDF. Generates ONE complete PDF with EVERY राम written,
+// streamed via PDFKit — no WebView, so it never hits the on-device expo-print memory
+// wall that failed at large counts. Same query/params as /reports/chant-summary.
+router.get('/reports/ram-pdf', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User, DailySummary } = getModels();
+    const { periodStart, periodEnd, appId, userId, topN: topNRaw } = req.query;
+    if (!periodStart || !periodEnd) {
+      return res.status(400).json({ success: false, message: 'periodStart and periodEnd are required (YYYY-MM-DD)' });
+    }
+    const start = moment(periodStart, 'YYYY-MM-DD', true);
+    const end = moment(periodEnd, 'YYYY-MM-DD', true);
+    if (!start.isValid() || !end.isValid() || end.isBefore(start)) {
+      return res.status(400).json({ success: false, message: 'Invalid period range' });
+    }
+    const startStr = start.format('YYYY-MM-DD');
+    const endStr = end.format('YYYY-MM-DD');
+    const parsedTopN = parseInt(topNRaw, 10);
+    const topN = Number.isFinite(parsedTopN) && parsedTopN > 0 ? parsedTopN : 0;
+
+    let rows = [];
+    let totalCount = 0;
+
+    if (dbFactory.isMongoDB()) {
+      const userMatch = { ...(appId && { appId }) };
+      const allUsers = userId ? await User.find({ _id: userId, ...(appId && { appId }) }) : await User.find(userMatch);
+      const summaryMatch = { date: { $gte: startStr, $lte: endStr } };
+      if (userId) summaryMatch.userId = userId;
+      const summaries = await DailySummary.find(summaryMatch);
+      const byUser = new Map();
+      summaries.forEach((s) => {
+        const uid = String(s.userId);
+        byUser.set(uid, (byUser.get(uid) || 0) + Number(s.dailyCount || 0));
+      });
+      rows = allUsers
+        .filter((u) => !appId || u.appId === appId)
+        .map((u) => {
+          const t = byUser.get(String(u._id)) || 0;
+          totalCount += t;
+          return { userId: String(u._id), name: u.name || '', mobile: u.mobile || '', email: u.email || '', totalCount: t };
+        })
+        .filter((r) => (userId ? true : r.totalCount > 0));
+    } else {
+      const userWhere = { ...(appId && { appId }) };
+      if (userId) userWhere.id = userId;
+      const allUsers = await User.findAll({ where: userWhere });
+      const summaryWhere = { date: { [Op.between]: [startStr, endStr] } };
+      if (userId) summaryWhere.userId = userId;
+      const summaries = await DailySummary.findAll({ where: summaryWhere });
+      const byUser = new Map();
+      summaries.forEach((s) => {
+        const uid = String(s.userId);
+        byUser.set(uid, (byUser.get(uid) || 0) + Number(s.dailyCount || 0));
+      });
+      rows = allUsers
+        .map((u) => {
+          const t = byUser.get(String(u.id)) || 0;
+          totalCount += t;
+          return { userId: String(u.id), name: u.name || '', mobile: u.mobile || '', email: u.email || '', totalCount: t };
+        })
+        .filter((r) => (userId ? true : r.totalCount > 0));
+    }
+
+    rows.sort((a, b) => b.totalCount - a.totalCount);
+    if (topN > 0) rows = rows.slice(0, topN);
+
+    const { streamRamPdf } = require('../utils/ramPdf');
+    const fname = `ram-naam-${userId ? 'user' : 'all'}-${startStr}_to_${endStr}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+    streamRamPdf(res, {
+      meta: { periodStart: startStr, periodEnd: endStr, scope: userId ? 'single' : 'all', generatedAt: new Date().toISOString() },
+      totals: { totalCount },
+      rows,
+    }, {});
+  } catch (error) {
+    console.error('🔴 Error generating राम PDF:', error);
+    if (!res.headersSent) res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;

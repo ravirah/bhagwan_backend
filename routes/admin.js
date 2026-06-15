@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { authMiddleware, adminMiddleware } = require('../middleware/auth');
+const { authMiddleware, adminMiddleware, requireMinAppVersion } = require('../middleware/auth');
 const getModels = require('../models');
 const dbFactory = require('../config/database');
 const moment = require('moment');
@@ -82,7 +82,7 @@ router.get('/users', authMiddleware, adminMiddleware, async (req, res) => {
 });
 
 // Update user status (approve / reject)
-router.put('/users/:userId/status', authMiddleware, adminMiddleware, async (req, res) => {
+router.put('/users/:userId/status', authMiddleware, adminMiddleware, requireMinAppVersion, async (req, res) => {
   try {
     const { User, Activity } = getModels();
     const { userId } = req.params;
@@ -120,7 +120,7 @@ router.put('/users/:userId/status', authMiddleware, adminMiddleware, async (req,
 });
 
 // Edit user details
-router.put('/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
+router.put('/users/:userId', authMiddleware, adminMiddleware, requireMinAppVersion, async (req, res) => {
   try {
     const { User } = getModels();
     const { userId } = req.params;
@@ -153,7 +153,7 @@ router.put('/users/:userId', authMiddleware, adminMiddleware, async (req, res) =
 // activity ledger / daily summaries — that is what permanently lost Sunil's 15,002 count.
 // Instead we mark the account 'rejected' (which blocks login) while keeping every row, so
 // the count is fully recoverable: an admin can re-approve and the totalCount is intact.
-router.delete('/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
+router.delete('/users/:userId', authMiddleware, adminMiddleware, requireMinAppVersion, async (req, res) => {
   try {
     const { User } = getModels();
     const { userId } = req.params;

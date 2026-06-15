@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const getModels = require('../models');
+const { requireMinAppVersion } = require('../middleware/auth');
 
 // The Activity table is the immutable ledger of every counted राम (one COUNT_INCREMENT
 // row per sync, carrying its delta). A user's totalCount is just a derived cache. If that
@@ -49,8 +50,8 @@ async function reconcileTotalFromLedger(models, dbFactory, user) {
  * Login/Register looks up by mobile + appId. If found → login; if not → auto-create.
  */
 
-// User Login/Register
-router.post('/login', async (req, res) => {
+// User Login/Register — gated by app version so old APKs are forced to update.
+router.post('/login', requireMinAppVersion, async (req, res) => {
   try {
     // Normalize the unique key so trailing spaces / casing can never cause the lookup to
     // miss an existing user and silently create a fresh 0-count duplicate.

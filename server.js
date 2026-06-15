@@ -49,6 +49,20 @@ app.use('/api/activities', require('./routes/activities'));
 app.use('/api/slogans', require('./routes/slogans'));
 app.use('/api/admin', require('./routes/admin'));
 
+// Public app-config — the app polls this on launch to enforce a minimum version.
+// If the installed build is below minSupportedVersion, the app shows an "Update
+// required" screen. updateUrl points to the latest APK.
+app.get('/api/app-config', (req, res) => {
+  const { MIN_APP_BUILD } = require('./middleware/auth');
+  res.json({
+    success: true,
+    minSupportedVersion: MIN_APP_BUILD,
+    latestVersion: Number(process.env.LATEST_APP_BUILD) || MIN_APP_BUILD,
+    updateUrl: process.env.APP_UPDATE_URL || '',
+    message: 'A newer version of the app is required.',
+  });
+});
+
 // Health Check - use /api prefix for consistency
 app.get('/api/health', (req, res) => {
   res.json({

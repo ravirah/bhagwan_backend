@@ -33,4 +33,27 @@ const adminMiddleware = (req, res, next) => {
   }
 };
 
-module.exports = { authMiddleware, adminMiddleware };
+// Minimum app build (Android versionCode) allowed to perform gated operations.
+// Override via env MIN_APP_BUILD (e.g. set to 0 in Render to disable the gate instantly
+// as a safety valve, without a code change). Clients send their build in X-App-Version.
+const MIN_APP_BUILD = Number(process.env.MIN_APP_BUILD) || 10;
+
+// Rejects requests from app versions below MIN_APP_BUILD (or that send no version —
+// i.e. old APKs predating version reporting). Blocks old apps from destructive actions
+// and forces an update. Pass it BEFORE the route handler.
+const requireMinAppVersion = (req, res, next) => {
+  const raw = req.headers['x-app-version'];
+  const build = parseInt(raw, 10);
+  // Missing/old version → block. (New apps always send a numeric build.)
+  if (!Number.isFinite(build) || build < MIN_APP_BUILD) {
+    return res.status(426).json({
+      success: false,
+      code: 'UPDATE_REQUIRED',
+      minSupportedVersion: MIN_APP_BUILD,
+      message: 'Please update to the latest version of the app to continue.',
+    });
+  }
+  next();
+};
+
+module.exports = { authMiddleware, adminMiddleware, requireMinAppVersion, MIN_APP_BUILD };

@@ -319,11 +319,48 @@ router.put('/users/:userId/set-count', authMiddleware, adminMiddleware, async (r
     if (dbFactory.isMongoDB()) { user.totalCount = newTotal; await user.save(); }
     else { await User.update({ totalCount: newTotal }, { where: { id: user.id } }); user = await User.findByPk(user.id); }
 
+    // Reports sum DailySummary.dailyCount over the period — NOT User.totalCount. So a
+    // restored total would still show as ~0 in reports/PDF. Backfill a recovery
+    // DailySummary row for the gap so the report matches the restored total. Dated to
+    // recoveryDate (or the account's creation date) — lands inside yearly/all-time reports.
+    let recoveryAdded = 0;
+    try {
+      const { DailySummary } = getModels();
+      const recoveryDate = (typeof req.body.recoveryDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.body.recoveryDate))
+        ? req.body.recoveryDate
+        : moment(user.createdAt || new Date()).format('YYYY-MM-DD');
+      const uid = user._id || user.id;
+      let summarySum = 0;
+      if (dbFactory.isMongoDB()) {
+        const agg = await DailySummary.aggregate([{ $match: { userId: uid } }, { $group: { _id: null, total: { $sum: '$dailyCount' } } }]);
+        summarySum = (agg && agg[0] && agg[0].total) || 0;
+      } else {
+        summarySum = (await DailySummary.sum('dailyCount', { where: { userId: uid } })) || 0;
+      }
+      const gap = newTotal - summarySum;
+      if (gap > 0) {
+        recoveryAdded = gap;
+        if (dbFactory.isMongoDB()) {
+          await DailySummary.findOneAndUpdate(
+            { userId: uid, date: recoveryDate },
+            { $inc: { dailyCount: gap }, $set: { appId: user.appId, totalCount: newTotal }, $setOnInsert: { userId: uid, date: recoveryDate } },
+            { upsert: true, new: true }
+          );
+        } else {
+          const [row, created] = await DailySummary.findOrCreate({
+            where: { userId: uid, date: recoveryDate },
+            defaults: { userId: uid, appId: user.appId, date: recoveryDate, dailyCount: gap, totalCount: newTotal },
+          });
+          if (!created) { row.dailyCount = Number(row.dailyCount || 0) + gap; row.totalCount = newTotal; await row.save(); }
+        }
+      }
+    } catch (e) { console.error('recovery summary error:', e.message); }
+
     await logAdminAction(req, 'SET_COUNT', {
       targetUserId: user._id || user.id, targetMobile: user.mobile,
-      details: { from: oldTotal, to: newTotal, reason: req.body.reason || null },
+      details: { from: oldTotal, to: newTotal, recoverySummaryAdded: recoveryAdded, reason: req.body.reason || null },
     });
-    res.json({ success: true, user, from: oldTotal, to: newTotal });
+    res.json({ success: true, user, from: oldTotal, to: newTotal, recoverySummaryAdded: recoveryAdded });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

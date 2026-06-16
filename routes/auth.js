@@ -79,27 +79,28 @@ router.post('/login', requireMinAppVersion, async (req, res) => {
     let isNewUser = false;
 
     if (dbFactory.isMongoDB()) {
-      // Look up user by mobile within this app (mobile is the unique key)
-      user = await User.findOne({ mobile, appId });
-      if (!user) {
-        // New user - auto-create account with pending status
-        user = new User({ name, mobile, appId, status: 'pending' });
-        await user.save();
-        isNewUser = true;
-      } else if (name && user.name !== name) {
-        // Existing user logging in with updated name — update it
-        user.name = name;
-        await user.save();
-      }
+      // Atomic upsert keyed on the unique (appId, mobile) index — two concurrent
+      // first-logins can't create duplicate rows. $setOnInsert applies only on create.
+      const before = await User.findOne({ mobile, appId });
+      isNewUser = !before;
+      user = await User.findOneAndUpdate(
+        { mobile, appId },
+        {
+          $setOnInsert: { name, mobile, appId, status: 'pending' },
+          ...(name && before && before.name !== name ? { $set: { name } } : {}),
+        },
+        { upsert: true, new: true }
+      );
     } else {
-      // SQL databases — mobile is the unique key
-      user = await User.findOne({ where: { mobile, appId } });
-      if (!user) {
-        // New user - auto-create account with pending status
-        user = await User.create({ name, mobile, appId, status: 'pending' });
-        isNewUser = true;
-      } else if (name && user.name !== name) {
-        // Existing user logging in with updated name — update it
+      // findOrCreate is atomic against the unique (appId, mobile) index — no duplicate
+      // rows under concurrent first-logins.
+      const [found, created] = await User.findOrCreate({
+        where: { mobile, appId },
+        defaults: { name, mobile, appId, status: 'pending' },
+      });
+      isNewUser = created;
+      user = found;
+      if (!created && name && user.name !== name) {
         await User.update({ name }, { where: { id: user.id } });
         user = await User.findByPk(user.id);
       }

@@ -28,6 +28,41 @@ async function logAdminAction(req, action, { targetUserId = null, targetMobile =
   }
 }
 
+// Enforce the invariant SUM(DailySummary.dailyCount) == canonicalTotal for a user by
+// adding a single recovery DailySummary row for the gap (reports sum DailySummary, so
+// without this a restored totalCount under-reports). Returns the gap added. THROWS on
+// failure (callers surface a 500) — recovery must never silently leave a gap.
+async function backfillSummaryGap(models, user, canonicalTotal, recoveryDate) {
+  const { DailySummary } = models;
+  const uid = user._id || user.id;
+  const date = (typeof recoveryDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(recoveryDate))
+    ? recoveryDate
+    : moment(user.createdAt || new Date()).format('YYYY-MM-DD');
+  let summarySum = 0;
+  if (dbFactory.isMongoDB()) {
+    const agg = await DailySummary.aggregate([{ $match: { userId: uid } }, { $group: { _id: null, total: { $sum: '$dailyCount' } } }]);
+    summarySum = (agg && agg[0] && agg[0].total) || 0;
+  } else {
+    summarySum = (await DailySummary.sum('dailyCount', { where: { userId: uid } })) || 0;
+  }
+  const gap = canonicalTotal - summarySum;
+  if (gap <= 0) return 0;
+  if (dbFactory.isMongoDB()) {
+    await DailySummary.findOneAndUpdate(
+      { userId: uid, date },
+      { $inc: { dailyCount: gap }, $set: { appId: user.appId, totalCount: canonicalTotal }, $setOnInsert: { userId: uid, date } },
+      { upsert: true, new: true }
+    );
+  } else {
+    const [row, created] = await DailySummary.findOrCreate({
+      where: { userId: uid, date },
+      defaults: { userId: uid, appId: user.appId, date, dailyCount: gap, totalCount: canonicalTotal },
+    });
+    if (!created) { row.dailyCount = Number(row.dailyCount || 0) + gap; row.totalCount = canonicalTotal; await row.save(); }
+  }
+  return gap;
+}
+
 // Get all users
 router.get('/users', authMiddleware, adminMiddleware, async (req, res) => {
   try {
@@ -186,41 +221,52 @@ router.delete('/users/:userId', authMiddleware, adminMiddleware, requireMinAppVe
 // history — e.g. after the old destructive bugs. Safe to run repeatedly.
 router.post('/reconcile-counts', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { User, Activity } = getModels();
-    const results = { checked: 0, restored: 0, details: [] };
+    const models = getModels();
+    const { User, Activity, DailySummary } = models;
+    const results = { checked: 0, restored: 0, summaryBackfilled: 0, details: [] };
+    const isMongo = dbFactory.isMongoDB();
 
-    if (dbFactory.isMongoDB()) {
-      const users = await User.find({});
-      for (const u of users) {
-        results.checked += 1;
+    const users = isMongo ? await User.find({}) : await User.findAll();
+    for (const u of users) {
+      results.checked += 1;
+      const uid = u._id || u.id;
+      // Floor 1: immutable activity ledger.
+      let ledger = 0;
+      if (isMongo) {
         const agg = await Activity.aggregate([
           { $match: { userId: u._id, activityType: 'COUNT_INCREMENT' } },
           { $group: { _id: null, total: { $sum: '$count' } } },
         ]);
-        const ledger = (agg && agg[0] && agg[0].total) || 0;
-        if (ledger > Number(u.totalCount || 0)) {
-          results.details.push({ id: u._id, mobile: u.mobile, from: u.totalCount, to: ledger });
-          u.totalCount = ledger;
-          await u.save();
-          results.restored += 1;
-        }
+        ledger = (agg && agg[0] && agg[0].total) || 0;
+      } else {
+        ledger = (await Activity.sum('count', { where: { userId: uid, activityType: 'COUNT_INCREMENT' } })) || 0;
       }
-    } else {
-      const users = await User.findAll();
-      for (const u of users) {
-        results.checked += 1;
-        const ledger = (await Activity.sum('count', {
-          where: { userId: u.id, activityType: 'COUNT_INCREMENT' },
-        })) || 0;
-        if (ledger > Number(u.totalCount || 0)) {
-          results.details.push({ id: u.id, mobile: u.mobile, from: u.totalCount, to: ledger });
-          await User.update({ totalCount: ledger }, { where: { id: u.id } });
-          results.restored += 1;
-        }
+      // Floor 2: existing daily-summary sum.
+      let summarySum = 0;
+      if (isMongo) {
+        const agg = await DailySummary.aggregate([{ $match: { userId: u._id } }, { $group: { _id: null, total: { $sum: '$dailyCount' } } }]);
+        summarySum = (agg && agg[0] && agg[0].total) || 0;
+      } else {
+        summarySum = (await DailySummary.sum('dailyCount', { where: { userId: uid } })) || 0;
       }
+      // Canonical = highest of the three (never lowers a count).
+      const current = Number(u.totalCount || 0);
+      const canonical = Math.max(current, ledger, summarySum);
+
+      let changed = false;
+      if (canonical > current) {
+        if (isMongo) { u.totalCount = canonical; await u.save(); }
+        else { await User.update({ totalCount: canonical }, { where: { id: uid } }); }
+        results.restored += 1;
+        changed = true;
+      }
+      // Enforce SUM(DailySummary) == canonical so reports match.
+      const backfilled = await backfillSummaryGap(models, u, canonical, moment(u.createdAt || new Date()).format('YYYY-MM-DD'));
+      if (backfilled > 0) { results.summaryBackfilled += 1; changed = true; }
+      if (changed) results.details.push({ id: uid, mobile: u.mobile, from: current, to: canonical, summaryGapAdded: backfilled });
     }
 
-    await logAdminAction(req, 'RECONCILE_COUNTS', { details: { checked: results.checked, restored: results.restored } });
+    await logAdminAction(req, 'RECONCILE_COUNTS', { details: { checked: results.checked, restored: results.restored, summaryBackfilled: results.summaryBackfilled } });
     res.json({ success: true, ...results });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -319,42 +365,9 @@ router.put('/users/:userId/set-count', authMiddleware, adminMiddleware, async (r
     if (dbFactory.isMongoDB()) { user.totalCount = newTotal; await user.save(); }
     else { await User.update({ totalCount: newTotal }, { where: { id: user.id } }); user = await User.findByPk(user.id); }
 
-    // Reports sum DailySummary.dailyCount over the period — NOT User.totalCount. So a
-    // restored total would still show as ~0 in reports/PDF. Backfill a recovery
-    // DailySummary row for the gap so the report matches the restored total. Dated to
-    // recoveryDate (or the account's creation date) — lands inside yearly/all-time reports.
-    let recoveryAdded = 0;
-    try {
-      const { DailySummary } = getModels();
-      const recoveryDate = (typeof req.body.recoveryDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.body.recoveryDate))
-        ? req.body.recoveryDate
-        : moment(user.createdAt || new Date()).format('YYYY-MM-DD');
-      const uid = user._id || user.id;
-      let summarySum = 0;
-      if (dbFactory.isMongoDB()) {
-        const agg = await DailySummary.aggregate([{ $match: { userId: uid } }, { $group: { _id: null, total: { $sum: '$dailyCount' } } }]);
-        summarySum = (agg && agg[0] && agg[0].total) || 0;
-      } else {
-        summarySum = (await DailySummary.sum('dailyCount', { where: { userId: uid } })) || 0;
-      }
-      const gap = newTotal - summarySum;
-      if (gap > 0) {
-        recoveryAdded = gap;
-        if (dbFactory.isMongoDB()) {
-          await DailySummary.findOneAndUpdate(
-            { userId: uid, date: recoveryDate },
-            { $inc: { dailyCount: gap }, $set: { appId: user.appId, totalCount: newTotal }, $setOnInsert: { userId: uid, date: recoveryDate } },
-            { upsert: true, new: true }
-          );
-        } else {
-          const [row, created] = await DailySummary.findOrCreate({
-            where: { userId: uid, date: recoveryDate },
-            defaults: { userId: uid, appId: user.appId, date: recoveryDate, dailyCount: gap, totalCount: newTotal },
-          });
-          if (!created) { row.dailyCount = Number(row.dailyCount || 0) + gap; row.totalCount = newTotal; await row.save(); }
-        }
-      }
-    } catch (e) { console.error('recovery summary error:', e.message); }
+    // Enforce SUM(DailySummary) == newTotal so reports/PDF match the restored total.
+    // No silent catch — if this throws, the request returns 500 (no half-applied state).
+    const recoveryAdded = await backfillSummaryGap(getModels(), user, newTotal, req.body.recoveryDate);
 
     await logAdminAction(req, 'SET_COUNT', {
       targetUserId: user._id || user.id, targetMobile: user.mobile,
@@ -505,34 +518,41 @@ router.get('/users/:userId', authMiddleware, adminMiddleware, async (req, res) =
 // Get all activities
 router.get('/activities', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { Activity } = getModels();
-    const { limit = 100, page = 1, type = '', userId = '', appId } = req.query;
+    const { Activity, User } = getModels();
+    const limit = parseInt(req.query.limit, 10) || 50;
+    const page = parseInt(req.query.page, 10) || 1;
+    const { type = '', userId = '', appId } = req.query;
     const skip = (page - 1) * limit;
 
-    let activities;
+    let activities, total;
     if (dbFactory.isMongoDB()) {
       const query = {};
+      // Exclude the per-count COUNT_INCREMENT spam from the human feed unless explicitly
+      // requested — those flood the list and belong in stats, not the activity log.
       if (type) query.activityType = type;
+      else query.activityType = { $ne: 'COUNT_INCREMENT' };
       if (userId) query.userId = userId;
       if (appId) query.appId = appId;
-      
+
+      total = await Activity.countDocuments(query);
       activities = await Activity.find(query)
         .populate('userId', 'name email')
         .sort({ timestamp: -1 })
-        .limit(parseInt(limit))
+        .limit(limit)
         .skip(skip);
     } else {
       const where = {};
       if (type) where.activityType = type;
+      else where.activityType = { [Op.ne]: 'COUNT_INCREMENT' };
       if (userId) where.userId = userId;
       if (appId) where.appId = appId;
-      
-      const { User } = getModels();
+
+      total = await Activity.count({ where });
       activities = await Activity.findAll({
         where,
         include: [{ model: User, attributes: ['name', 'email'] }],
         order: [['timestamp', 'DESC']],
-        limit: parseInt(limit),
+        limit,
         offset: skip
       });
     }
@@ -540,7 +560,7 @@ router.get('/activities', authMiddleware, adminMiddleware, async (req, res) => {
     res.json({
       success: true,
       activities,
-      pagination: { page: parseInt(page), limit: parseInt(limit) }
+      pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) }
     });
   } catch (error) {
     res.status(500).json({ 

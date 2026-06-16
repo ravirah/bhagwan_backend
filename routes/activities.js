@@ -22,6 +22,7 @@ router.post('/add-count', authMiddleware, async (req, res) => {
     const today = moment(now).format('YYYY-MM-DD');
 
     let user;
+    let summary;
     if (dbFactory.isMongoDB()) {
       user = await User.findByIdAndUpdate(
         req.user.userId,
@@ -31,28 +32,13 @@ router.post('/add-count', authMiddleware, async (req, res) => {
         },
         { new: true }
       );
-    } else {
-      user = await User.findByPk(req.user.userId);
-      // Atomic DB-level increment (UPDATE ... SET totalCount = totalCount + count) so
-      // concurrent requests can't read the same value and clobber each other.
-      await user.increment({ totalCount: count });
-      user.lastActiveDate = now;
-      // Persist only the timestamp — re-saving the whole instance would write back a
-      // stale in-memory totalCount and undo the atomic increment above.
-      await user.save({ fields: ['lastActiveDate'] });
-      await user.reload();
-    }
-
-    await Activity.create({
-      userId: req.user.userId,
-      appId: user.appId,
-      activityType: 'COUNT_INCREMENT',
-      count,
-      timestamp: now
-    });
-
-    let summary;
-    if (dbFactory.isMongoDB()) {
+      await Activity.create({
+        userId: req.user.userId,
+        appId: user.appId,
+        activityType: 'COUNT_INCREMENT',
+        count,
+        timestamp: now
+      });
       summary = await DailySummary.findOneAndUpdate(
         { userId: req.user.userId, date: today },
         {
@@ -73,38 +59,57 @@ router.post('/add-count', authMiddleware, async (req, res) => {
         },
         { upsert: true, new: true }
       );
-
       summary.activeDurationSeconds = getActiveDurationSeconds(summary.firstCountAt, summary.lastCountAt);
       await summary.save();
     } else {
-      const [foundSummary, created] = await DailySummary.findOrCreate({
-        where: { userId: req.user.userId, date: today },
-        defaults: {
-          userId: req.user.userId,
-          appId: user.appId,
-          date: today,
-          dailyCount: count,
-          totalCount: user.totalCount,
-          firstCountAt: now,
-          lastCountAt: now,
-          activeDurationSeconds: 0
-        }
-      });
+      // SQL: one ATOMIC transaction for totalCount + ledger + daily summary, so the three
+      // stores can never drift apart (the root cause of inconsistent counts). If any write
+      // fails, the whole increment rolls back and the mobile pending-queue retries.
+      const sequelize = dbFactory.getConnection();
+      const result = await sequelize.transaction(async (t) => {
+        const u = await User.findByPk(req.user.userId, { transaction: t });
+        await u.increment({ totalCount: count }, { transaction: t });
+        u.lastActiveDate = now;
+        await u.save({ fields: ['lastActiveDate'], transaction: t });
+        await u.reload({ transaction: t });
 
-      summary = foundSummary;
-      if (!created) {
-        // Atomic DB-level increment of the daily counter.
-        await summary.increment({ dailyCount: count });
-        const newFirstCountAt = summary.firstCountAt && new Date(summary.firstCountAt) < now ? summary.firstCountAt : now;
-        summary.totalCount = user.totalCount;
-        summary.appId = user.appId;
-        summary.firstCountAt = newFirstCountAt;
-        summary.lastCountAt = now;
-        summary.activeDurationSeconds = getActiveDurationSeconds(newFirstCountAt, now);
-        // Save only the metadata fields; dailyCount is owned by the atomic increment above.
-        await summary.save({ fields: ['totalCount', 'appId', 'firstCountAt', 'lastCountAt', 'activeDurationSeconds'] });
-        await summary.reload();
-      }
+        await Activity.create({
+          userId: req.user.userId,
+          appId: u.appId,
+          activityType: 'COUNT_INCREMENT',
+          count,
+          timestamp: now
+        }, { transaction: t });
+
+        const [s, created] = await DailySummary.findOrCreate({
+          where: { userId: req.user.userId, date: today },
+          defaults: {
+            userId: req.user.userId,
+            appId: u.appId,
+            date: today,
+            dailyCount: count,
+            totalCount: u.totalCount,
+            firstCountAt: now,
+            lastCountAt: now,
+            activeDurationSeconds: 0
+          },
+          transaction: t
+        });
+        if (!created) {
+          await s.increment({ dailyCount: count }, { transaction: t });
+          const newFirstCountAt = s.firstCountAt && new Date(s.firstCountAt) < now ? s.firstCountAt : now;
+          s.totalCount = u.totalCount;
+          s.appId = u.appId;
+          s.firstCountAt = newFirstCountAt;
+          s.lastCountAt = now;
+          s.activeDurationSeconds = getActiveDurationSeconds(newFirstCountAt, now);
+          await s.save({ fields: ['totalCount', 'appId', 'firstCountAt', 'lastCountAt', 'activeDurationSeconds'], transaction: t });
+          await s.reload({ transaction: t });
+        }
+        return { user: u, summary: s };
+      });
+      user = result.user;
+      summary = result.summary;
     }
 
     res.json({

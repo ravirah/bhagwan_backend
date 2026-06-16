@@ -21,6 +21,16 @@ app.use(compression());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Never cache API responses — guarantees web browsers, proxies and CDNs always serve
+// live data (no stale counts/reports). Mobile (axios) doesn't cache GETs, but this makes
+// realtime data the contract for every client.
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
+
 // Initialize Database
 let db = null;
 

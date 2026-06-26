@@ -10,6 +10,14 @@ const ACTIVITY_LABELS = {
   REJECTION: 'User Rejected / Deactivated',
   DAILY_RESET: 'Daily Count Reset',
   COUNT_INCREMENT: 'Chant Recorded', // normally hidden from the feed
+  // Admin audit actions
+  DELETE_USER: 'User Deleted',
+  RESTORE_USER: 'User Restored',
+  DEACTIVATE_USER: 'User Deactivated',
+  EDIT_USER: 'User Edited',
+  STATUS_CHANGE: 'Status Changed',
+  SET_COUNT: 'Count Updated',
+  RECONCILE_COUNTS: 'Counts Reconciled',
 };
 
 function activityLabel(type) {

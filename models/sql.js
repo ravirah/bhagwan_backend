@@ -18,6 +18,22 @@ function getSyncMode() {
   return process.env.NODE_ENV === 'production' ? 'safe' : 'alter';
 }
 
+// Idempotently add a column to an existing table. Needed because safe-mode sync()
+// only CREATES missing tables — it never adds columns to an existing one. Re-running is
+// harmless (the duplicate-column error is swallowed). Works on MySQL (prod) and SQLite (dev).
+async function ensureColumn(sequelize, table, columnDdl, columnName) {
+  try {
+    await sequelize.query(`ALTER TABLE ${table} ADD COLUMN ${columnDdl}`);
+    console.log(`✅ Added column ${table}.${columnName}`);
+  } catch (e) {
+    if (/duplicate column|already exists|duplicate column name/i.test(e.message || '')) {
+      // Column already present — nothing to do.
+    } else {
+      console.warn(`ensureColumn(${table}.${columnName}) note:`, e.message);
+    }
+  }
+}
+
 async function syncDatabase(sequelize) {
   const syncMode = getSyncMode();
 
@@ -96,6 +112,13 @@ async function initModels(sequelize) {
     lastActiveDate: {
       type: DataTypes.DATE,
       defaultValue: DataTypes.NOW
+    },
+    // Soft-delete marker. Non-null = "deleted" (hidden from admin lists & blocked at
+    // login) but the row and all activities/summaries are kept intact and recoverable.
+    deletedAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      defaultValue: null
     }
   }, {
     tableName: 'users',
@@ -262,6 +285,8 @@ async function initModels(sequelize) {
   DailySummary.belongsTo(User, { foreignKey: 'userId', constraints: false });
 
   await syncDatabase(sequelize);
+  // safe-sync doesn't add columns to an existing table, so add deletedAt explicitly.
+  await ensureColumn(sequelize, 'users', 'deletedAt DATETIME NULL', 'deletedAt');
   await seedDefaultSlogans(Slogan);
 
   return { User, Activity, DailySummary, Slogan, AuditLog };

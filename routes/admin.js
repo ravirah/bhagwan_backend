@@ -72,29 +72,30 @@ router.get('/users', authMiddleware, adminMiddleware, async (req, res) => {
 
     let users;
     if (dbFactory.isMongoDB()) {
-      const query = { ...(appId && { appId }) };
-      
+      // Hide soft-deleted users from the admin list (their data is kept, just not shown).
+      const query = { ...(appId && { appId }), deletedAt: null };
+
       if (search) {
         query.$or = [
           { name: { $regex: search, $options: 'i' } },
           { email: { $regex: search, $options: 'i' } }
         ];
       }
-      
+
       users = await User.find(query)
         .sort({ lastActiveDate: -1 })
         .limit(parseInt(limit))
         .skip(skip);
     } else {
-      const where = { ...(appId && { appId }) };
-      
+      const where = { ...(appId && { appId }), deletedAt: null };
+
       if (search) {
         where[Op.or] = [
           { name: { [Op.like]: `%${search}%` } },
           { email: { [Op.like]: `%${search}%` } }
         ];
       }
-      
+
       users = await User.findAll({
         where,
         order: [['lastActiveDate', 'DESC']],
@@ -184,33 +185,75 @@ router.put('/users/:userId', authMiddleware, adminMiddleware, requireMinAppVersi
   }
 });
 
-// Deactivate a user (data-safe "delete"). We NEVER hard-delete the user or destroy their
-// activity ledger / daily summaries — that is what permanently lost Sunil's 15,002 count.
-// Instead we mark the account 'rejected' (which blocks login) while keeping every row, so
-// the count is fully recoverable: an admin can re-approve and the totalCount is intact.
+// Soft-delete a user (data-safe). We NEVER hard-delete the row or destroy their activity
+// ledger / daily summaries. We set deletedAt = now, which HIDES them from admin lists and
+// BLOCKS login, while keeping every row intact and fully recoverable (see /restore). The
+// deletion is recorded in the audit trail (who/when/IP) as the deletion history.
 router.delete('/users/:userId', authMiddleware, adminMiddleware, requireMinAppVersion, async (req, res) => {
   try {
     const { User } = getModels();
     const { userId } = req.params;
+    const now = new Date();
 
     let user;
     if (dbFactory.isMongoDB()) {
       user = await User.findById(userId);
       if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-      user = await User.findByIdAndUpdate(userId, { status: 'rejected' }, { new: true });
+      user = await User.findByIdAndUpdate(userId, { deletedAt: now }, { new: true });
     } else {
       user = await User.findByPk(userId);
       if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-      await User.update({ status: 'rejected' }, { where: { id: userId } });
+      await User.update({ deletedAt: now }, { where: { id: userId } });
       user = await User.findByPk(userId);
     }
 
-    await logAdminAction(req, 'DEACTIVATE_USER', { targetUserId: user._id || user.id, targetMobile: user.mobile, details: { previousStatus: 'see history' } });
+    await logAdminAction(req, 'DELETE_USER', {
+      targetUserId: user._id || user.id, targetMobile: user.mobile,
+      details: { name: user.name, totalCount: user.totalCount, deletedAt: now },
+    });
     res.json({
       success: true,
-      message: 'User deactivated. Their count and history are preserved — re-approve to restore.',
+      message: 'User deleted (hidden from lists). All data is preserved and recoverable.',
       user,
     });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Restore a soft-deleted user (clear deletedAt) — undoes a delete, data was never lost.
+router.put('/users/:userId/restore', authMiddleware, adminMiddleware, requireMinAppVersion, async (req, res) => {
+  try {
+    const { User } = getModels();
+    const { userId } = req.params;
+    let user;
+    if (dbFactory.isMongoDB()) {
+      user = await User.findByIdAndUpdate(userId, { deletedAt: null }, { new: true });
+    } else {
+      await User.update({ deletedAt: null }, { where: { id: userId } });
+      user = await User.findByPk(userId);
+    }
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    await logAdminAction(req, 'RESTORE_USER', { targetUserId: user._id || user.id, targetMobile: user.mobile, details: { name: user.name } });
+    res.json({ success: true, message: 'User restored.', user });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// List soft-deleted users (the deletion view): who was deleted, their preserved count,
+// and when. Data is intact — each can be restored.
+router.get('/deleted-users', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User } = getModels();
+    const { appId } = req.query;
+    let users;
+    if (dbFactory.isMongoDB()) {
+      users = await User.find({ ...(appId && { appId }), deletedAt: { $ne: null } }).sort({ deletedAt: -1 });
+    } else {
+      users = await User.findAll({ where: { ...(appId && { appId }), deletedAt: { [Op.ne]: null } }, order: [['deletedAt', 'DESC']] });
+    }
+    res.json({ success: true, users });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -581,7 +624,8 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
 
     let stats;
     if (dbFactory.isMongoDB()) {
-      const userQuery = { ...(appId && { appId }) };
+      // Exclude soft-deleted users from all dashboard counts/top-lists.
+      const userQuery = { ...(appId && { appId }), deletedAt: null };
       const activityQuery = {
         activityType: 'LOGIN',
         timestamp: { $gte: moment().startOf('day').toDate() },
@@ -600,7 +644,7 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
         { $group: { _id: null, totalCount: { $sum: '$dailyCount' } } }
       ]);
 
-      const allTimeUsers = await User.find({ ...(appId && { appId }) }, 'totalCount name');
+      const allTimeUsers = await User.find({ ...(appId && { appId }), deletedAt: null }, 'totalCount name');
       const allTimeTotalCount = allTimeUsers.reduce((sum, u) => sum + (u.totalCount || 0), 0);
 
       // Top chanter all-time
@@ -628,7 +672,7 @@ router.get('/stats', authMiddleware, adminMiddleware, async (req, res) => {
         topChanterAllTime: topAllTime ? { name: topAllTime.name, count: topAllTime.totalCount } : null,
       };
     } else {
-      const userWhere = { ...(appId && { appId }) };
+      const userWhere = { ...(appId && { appId }), deletedAt: null };
       const activityWhere = {
         activityType: 'LOGIN',
         timestamp: { [Op.gte]: moment().startOf('day').toDate() },
@@ -692,25 +736,26 @@ router.get('/apps', authMiddleware, adminMiddleware, async (req, res) => {
     
     let apps;
     if (dbFactory.isMongoDB()) {
-      // MongoDB aggregation to get unique apps with counts
+      // MongoDB aggregation to get unique apps with counts (excluding soft-deleted users)
       apps = await User.aggregate([
-        { $group: { 
-          _id: '$appId', 
+        { $match: { deletedAt: null } },
+        { $group: {
+          _id: '$appId',
           userCount: { $sum: 1 }
         }},
         { $sort: { _id: 1 } }
       ]);
-      
+
       apps = apps.map(app => ({
         appId: app._id,
         name: app._id, // Will be formatted on frontend
         userCount: app.userCount
       }));
     } else {
-      // SQL query to get unique apps with counts
+      // SQL query to get unique apps with counts (excluding soft-deleted users)
       const sequelize = dbFactory.getConnection();
       const results = await sequelize.query(
-        'SELECT appId, COUNT(*) as userCount FROM users GROUP BY appId ORDER BY appId',
+        'SELECT appId, COUNT(*) as userCount FROM users WHERE deletedAt IS NULL GROUP BY appId ORDER BY appId',
         { type: QueryTypes.SELECT }
       );
       
@@ -926,9 +971,9 @@ router.get('/reports/chant-summary', authMiddleware, adminMiddleware, async (req
     let activeUsersSet = new Set();
 
     if (dbFactory.isMongoDB()) {
-      const userMatch = { ...(appId && { appId }) };
+      const userMatch = { ...(appId && { appId }), deletedAt: null };
       const allUsers = userId
-        ? await User.find({ _id: userId, ...(appId && { appId }) })
+        ? await User.find({ _id: userId, ...(appId && { appId }), deletedAt: null })
         : await User.find(userMatch);
 
       const summaryMatch = {
@@ -975,7 +1020,7 @@ router.get('/reports/chant-summary', authMiddleware, adminMiddleware, async (req
         // otherwise drop zero-count users so the payload only carries meaningful rows.
         .filter((r) => (userId ? true : r.totalCount > 0));
     } else {
-      const userWhere = { ...(appId && { appId }) };
+      const userWhere = { ...(appId && { appId }), deletedAt: null };
       if (userId) userWhere.id = userId;
       const allUsers = await User.findAll({ where: userWhere });
 
@@ -1072,8 +1117,8 @@ router.get('/reports/ram-pdf', authMiddleware, adminMiddleware, async (req, res)
     let totalCount = 0;
 
     if (dbFactory.isMongoDB()) {
-      const userMatch = { ...(appId && { appId }) };
-      const allUsers = userId ? await User.find({ _id: userId, ...(appId && { appId }) }) : await User.find(userMatch);
+      const userMatch = { ...(appId && { appId }), deletedAt: null };
+      const allUsers = userId ? await User.find({ _id: userId, ...(appId && { appId }), deletedAt: null }) : await User.find(userMatch);
       const summaryMatch = { date: { $gte: startStr, $lte: endStr } };
       if (userId) summaryMatch.userId = userId;
       const summaries = await DailySummary.find(summaryMatch);
@@ -1091,7 +1136,7 @@ router.get('/reports/ram-pdf', authMiddleware, adminMiddleware, async (req, res)
         })
         .filter((r) => (userId ? true : r.totalCount > 0));
     } else {
-      const userWhere = { ...(appId && { appId }) };
+      const userWhere = { ...(appId && { appId }), deletedAt: null };
       if (userId) userWhere.id = userId;
       const allUsers = await User.findAll({ where: userWhere });
       const summaryWhere = { date: { [Op.between]: [startStr, endStr] } };

@@ -39,6 +39,11 @@ const userSchema = new mongoose.Schema({
     type: Date,
     default: Date.now
   },
+  // Soft-delete marker (non-null = deleted: hidden from admin & blocked at login, data kept).
+  deletedAt: {
+    type: Date,
+    default: null
+  },
   createdAt: {
     type: Date,
     default: Date.now

@@ -106,6 +106,19 @@ router.post('/login', requireMinAppVersion, async (req, res) => {
       }
     }
 
+    // Block soft-deleted accounts from logging in (their data is preserved; an admin must
+    // restore them first). We find-then-block rather than filtering the lookup, so we never
+    // create a duplicate row against the unique (appId, mobile) index.
+    if (user && user.deletedAt) {
+      return res.json({
+        success: true,
+        approved: false,
+        status: 'deleted',
+        message: 'This account has been removed. Please contact the admin.',
+        user: { id: user._id || user.id, name: user.name, mobile: user.mobile, status: 'deleted' },
+      });
+    }
+
     // Log activity
     if (dbFactory.isMongoDB()) {
       await Activity.create({
@@ -195,9 +208,9 @@ router.post('/lookup', async (req, res) => {
 
     let user;
     if (dbFactory.isMongoDB()) {
-      user = await User.findOne({ mobile, appId });
+      user = await User.findOne({ mobile, appId, deletedAt: null });
     } else {
-      user = await User.findOne({ where: { mobile, appId } });
+      user = await User.findOne({ where: { mobile, appId, deletedAt: null } });
     }
 
     if (user) {

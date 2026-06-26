@@ -237,18 +237,20 @@ router.post('/admin/login', async (req, res) => {
   try {
     const { username, password } = req.body;
 
-    if (username !== process.env.ADMIN_USERNAME || 
-        password !== process.env.ADMIN_PASSWORD) {
-      return res.status(401).json({ 
-        success: false, 
-        message: 'Invalid credentials' 
+    const { verifyAdminLogin } = require('../utils/adminCredential');
+    const dbFactory = require('../config/database');
+    const ok = await verifyAdminLogin(getModels(), dbFactory, username, password);
+    if (!ok) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
       });
     }
 
     const token = jwt.sign(
-      { 
-        username, 
-        isAdmin: true 
+      {
+        username,
+        isAdmin: true
       },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }

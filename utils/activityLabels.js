@@ -18,6 +18,7 @@ const ACTIVITY_LABELS = {
   STATUS_CHANGE: 'Status Changed',
   SET_COUNT: 'Count Updated',
   RECONCILE_COUNTS: 'Counts Reconciled',
+  CHANGE_PASSWORD: 'Admin Password Changed',
 };
 
 function activityLabel(type) {

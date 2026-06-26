@@ -159,11 +159,17 @@ const auditLogSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, index: true },
 });
 
+const adminCredentialSchema = new mongoose.Schema({
+  username: { type: String, required: true },
+  passwordHash: { type: String, required: true },
+}, { timestamps: true });
+
 const User = mongoose.model('User', userSchema);
 const Activity = mongoose.model('Activity', activitySchema);
 const DailySummary = mongoose.model('DailySummary', dailySummarySchema);
 const Slogan = mongoose.models.Slogan || mongoose.model('Slogan', sloganSchema);
 const AuditLog = mongoose.models.AuditLog || mongoose.model('AuditLog', auditLogSchema);
+const AdminCredential = mongoose.models.AdminCredential || mongoose.model('AdminCredential', adminCredentialSchema);
 
 for (const [appId, slogans] of Object.entries(defaultSlogans)) {
   for (const slogan of slogans) {
@@ -175,7 +181,7 @@ for (const [appId, slogans] of Object.entries(defaultSlogans)) {
   }
 }
 
-module.exports = { User, Activity, DailySummary, Slogan, AuditLog };
+module.exports = { User, Activity, DailySummary, Slogan, AuditLog, AdminCredential };
 
 
 

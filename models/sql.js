@@ -70,7 +70,7 @@ async function syncDatabase(sequelize) {
  * Database has UNIQUE constraint on (appId, mobile) - same mobile can exist in different apps.
  */
 
-let User, Activity, DailySummary, Slogan, AuditLog;
+let User, Activity, DailySummary, Slogan, AuditLog, AdminCredential;
 
 async function initModels(sequelize) {
   User = sequelize.define('User', {
@@ -278,6 +278,15 @@ async function initModels(sequelize) {
     ],
   });
 
+  AdminCredential = sequelize.define('AdminCredential', {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    username: { type: DataTypes.STRING, allowNull: false },
+    passwordHash: { type: DataTypes.STRING, allowNull: false },
+  }, {
+    tableName: 'adminconfigs',
+    timestamps: true,
+  });
+
   User.hasMany(Activity, { foreignKey: 'userId', constraints: false });
   Activity.belongsTo(User, { foreignKey: 'userId', constraints: false });
 
@@ -289,11 +298,11 @@ async function initModels(sequelize) {
   await ensureColumn(sequelize, 'users', 'deletedAt DATETIME NULL', 'deletedAt');
   await seedDefaultSlogans(Slogan);
 
-  return { User, Activity, DailySummary, Slogan, AuditLog };
+  return { User, Activity, DailySummary, Slogan, AuditLog, AdminCredential };
 }
 
 function getModels() {
-  return { User, Activity, DailySummary, Slogan, AuditLog };
+  return { User, Activity, DailySummary, Slogan, AuditLog, AdminCredential };
 }
 
 module.exports = { initModels, getModels };

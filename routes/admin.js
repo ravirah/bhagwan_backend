@@ -422,6 +422,34 @@ router.put('/users/:userId/set-count', authMiddleware, adminMiddleware, async (r
   }
 });
 
+// Change the admin password (in-app). Verifies the current password (against the stored
+// credential OR the env master), then stores the new one hashed. The env-var password
+// (ADMIN_PASSWORD) always remains valid as a recovery master, so there is no lockout risk.
+router.put('/change-password', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!newPassword || String(newPassword).length < 6) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 6 characters.' });
+    }
+    if (currentPassword === newPassword) {
+      return res.status(400).json({ success: false, message: 'New password must be different from the current password.' });
+    }
+
+    const { verifyAdminLogin, setAdminPassword } = require('../utils/adminCredential');
+    const adminUsername = (req.user && req.user.username) || process.env.ADMIN_USERNAME || 'admin';
+    const ok = await verifyAdminLogin(getModels(), dbFactory, adminUsername, currentPassword);
+    if (!ok) {
+      return res.status(401).json({ success: false, message: 'Current password is incorrect.' });
+    }
+
+    await setAdminPassword(getModels(), dbFactory, newPassword);
+    await logAdminAction(req, 'CHANGE_PASSWORD', { details: { changedBy: adminUsername } });
+    res.json({ success: true, message: 'Admin password changed successfully.' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // View the admin audit trail (who did what, when). Newest first.
 router.get('/audit-logs', authMiddleware, adminMiddleware, async (req, res) => {
   try {

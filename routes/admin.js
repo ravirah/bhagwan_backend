@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { authMiddleware, adminMiddleware, requireMinAppVersion } = require('../middleware/auth');
+const { authMiddleware, adminMiddleware, requireMinAdminAppVersion } = require('../middleware/auth');
 const getModels = require('../models');
 const dbFactory = require('../config/database');
 const moment = require('moment');
@@ -118,7 +118,7 @@ router.get('/users', authMiddleware, adminMiddleware, async (req, res) => {
 });
 
 // Update user status (approve / reject)
-router.put('/users/:userId/status', authMiddleware, adminMiddleware, requireMinAppVersion, async (req, res) => {
+router.put('/users/:userId/status', authMiddleware, adminMiddleware, requireMinAdminAppVersion, async (req, res) => {
   try {
     const { User, Activity } = getModels();
     const { userId } = req.params;
@@ -156,7 +156,7 @@ router.put('/users/:userId/status', authMiddleware, adminMiddleware, requireMinA
 });
 
 // Edit user details
-router.put('/users/:userId', authMiddleware, adminMiddleware, requireMinAppVersion, async (req, res) => {
+router.put('/users/:userId', authMiddleware, adminMiddleware, requireMinAdminAppVersion, async (req, res) => {
   try {
     const { User } = getModels();
     const { userId } = req.params;
@@ -189,7 +189,7 @@ router.put('/users/:userId', authMiddleware, adminMiddleware, requireMinAppVersi
 // ledger / daily summaries. We set deletedAt = now, which HIDES them from admin lists and
 // BLOCKS login, while keeping every row intact and fully recoverable (see /restore). The
 // deletion is recorded in the audit trail (who/when/IP) as the deletion history.
-router.delete('/users/:userId', authMiddleware, adminMiddleware, requireMinAppVersion, async (req, res) => {
+router.delete('/users/:userId', authMiddleware, adminMiddleware, requireMinAdminAppVersion, async (req, res) => {
   try {
     const { User } = getModels();
     const { userId } = req.params;
@@ -222,7 +222,7 @@ router.delete('/users/:userId', authMiddleware, adminMiddleware, requireMinAppVe
 });
 
 // Restore a soft-deleted user (clear deletedAt) — undoes a delete, data was never lost.
-router.put('/users/:userId/restore', authMiddleware, adminMiddleware, requireMinAppVersion, async (req, res) => {
+router.put('/users/:userId/restore', authMiddleware, adminMiddleware, requireMinAdminAppVersion, async (req, res) => {
   try {
     const { User } = getModels();
     const { userId } = req.params;

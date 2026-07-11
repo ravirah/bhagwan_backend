@@ -73,15 +73,24 @@ function log(...a) { if (!JSON_OUT) console.log(...a); }
     below.sort((a, b) => a.drift - b.drift);          // most-negative first
     above.sort((a, b) => b.drift - a.drift);          // largest gap first
 
-    // 2) Idempotency invariant: no duplicate (userId, clientEventId).
-    const dups = await sequelize.query(
-      `SELECT userId, clientEventId, COUNT(*) AS c
-         FROM activities
-        WHERE clientEventId IS NOT NULL AND activityType = 'COUNT_INCREMENT'
-        GROUP BY userId, clientEventId
-       HAVING c > 1`,
-      { type: QueryTypes.SELECT }
-    );
+    // 2) Idempotency invariant: no duplicate (userId, clientEventId). Guarded so the monitor
+    //    still produces the core drift report even on a DB where the Phase 0 migration (the
+    //    clientEventId column) has not been applied yet.
+    let dups = [];
+    let dupCheckSkipped = false;
+    try {
+      dups = await sequelize.query(
+        `SELECT userId, clientEventId, COUNT(*) AS c
+           FROM activities
+          WHERE clientEventId IS NOT NULL AND activityType = 'COUNT_INCREMENT'
+          GROUP BY userId, clientEventId
+         HAVING c > 1`,
+        { type: QueryTypes.SELECT }
+      );
+    } catch (e) {
+      if (/clientEventId|unknown column/i.test(e.message || '')) dupCheckSkipped = true;
+      else throw e;
+    }
 
     const posAlert = POS_THRESHOLD > 0 ? above.filter(a => a.drift >= POS_THRESHOLD) : [];
     const critical = below.length > 0 || dups.length > 0 || posAlert.length > 0;
@@ -93,7 +102,7 @@ function log(...a) { if (!JSON_OUT) console.log(...a); }
     log(`   ✅ in sync (cache == ledger): ${rows.length - below.length - above.length}`);
     log(`   🟠 cache above ledger (info, usually admin/legacy): ${above.length}`);
     log(`   🔴 cache BELOW ledger (CRITICAL — shown total < actual): ${below.length}`);
-    log(`   🔁 duplicate idempotency keys: ${dups.length}`);
+    log(`   🔁 duplicate idempotency keys: ${dupCheckSkipped ? 'skipped (clientEventId column not present — run the Phase 0 migration)' : dups.length}`);
 
     if (below.length) {
       log('\n   CRITICAL — totalCount below ledger (potential lost display count):');

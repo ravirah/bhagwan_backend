@@ -34,6 +34,23 @@ async function ensureColumn(sequelize, table, columnDdl, columnName) {
   }
 }
 
+// Idempotently add a UNIQUE index to an existing table. Like ensureColumn, this is needed
+// because safe-mode sync() never adds indexes to an existing table. Re-running is harmless
+// (the duplicate-index error is swallowed). On MySQL a UNIQUE index treats NULLs as distinct,
+// so many legacy rows with a NULL value in the indexed column never collide.
+async function ensureUniqueIndex(sequelize, table, indexName, columns) {
+  try {
+    await sequelize.query(`CREATE UNIQUE INDEX ${indexName} ON ${table} (${columns.join(', ')})`);
+    console.log(`✅ Added unique index ${indexName} on ${table}`);
+  } catch (e) {
+    if (/already exists|duplicate key name|duplicate index/i.test(e.message || '')) {
+      // Index already present — nothing to do.
+    } else {
+      console.warn(`ensureUniqueIndex(${indexName}) note:`, e.message);
+    }
+  }
+}
+
 async function syncDatabase(sequelize) {
   const syncMode = getSyncMode();
 
@@ -158,6 +175,15 @@ async function initModels(sequelize) {
       type: DataTypes.JSON,
       defaultValue: {}
     },
+    // Client-generated idempotency key (UUID) for the offline sync queue. A retried sync
+    // carrying the same clientEventId is deduped by the UNIQUE(userId, clientEventId) index
+    // below instead of being double-counted. Nullable so legacy COUNT_INCREMENT rows and all
+    // non-count activity rows (LOGIN/REGISTER/…) — which never set it — stay valid; MySQL
+    // treats those NULLs as distinct, so they never collide.
+    clientEventId: {
+      type: DataTypes.STRING(64),
+      allowNull: true
+    },
     timestamp: {
       type: DataTypes.DATE,
       defaultValue: DataTypes.NOW
@@ -169,7 +195,8 @@ async function initModels(sequelize) {
       { fields: ['userId'] },
       { fields: ['timestamp'] },
       { fields: ['activityType'] },
-      { fields: ['appId'] }
+      { fields: ['appId'] },
+      { unique: true, fields: ['userId', 'clientEventId'], name: 'uniq_activity_user_event' }
     ]
   });
 
@@ -296,6 +323,10 @@ async function initModels(sequelize) {
   await syncDatabase(sequelize);
   // safe-sync doesn't add columns to an existing table, so add deletedAt explicitly.
   await ensureColumn(sequelize, 'users', 'deletedAt DATETIME NULL', 'deletedAt');
+  // Idempotency support for the offline sync queue (Phase 0). Adds the column + the
+  // dedupe index on existing tables in safe mode; a no-op once already present.
+  await ensureColumn(sequelize, 'activities', 'clientEventId VARCHAR(64) NULL', 'clientEventId');
+  await ensureUniqueIndex(sequelize, 'activities', 'uniq_activity_user_event', ['userId', 'clientEventId']);
   await seedDefaultSlogans(Slogan);
 
   return { User, Activity, DailySummary, Slogan, AuditLog, AdminCredential };

@@ -17,7 +17,16 @@ function getActiveDurationSeconds(firstCountAt, lastCountAt) {
 router.post('/add-count', authMiddleware, async (req, res) => {
   try {
     const { User, Activity, DailySummary } = getModels();
-    const { count = 1 } = req.body;
+    // Validate the delta. A missing field keeps the legacy default of 1 (backward compatible),
+    // but any explicitly-provided value must be a positive integer — this stops a malformed
+    // payload from silently truncating a batch to 1, or a negative value from lowering the total.
+    const count = req.body.count === undefined ? 1 : Number(req.body.count);
+    if (!Number.isInteger(count) || count <= 0) {
+      return res.status(422).json({
+        success: false,
+        message: 'count must be a positive integer'
+      });
+    }
     const now = new Date();
     const today = moment(now).format('YYYY-MM-DD');
 
@@ -127,6 +136,132 @@ router.post('/add-count', authMiddleware, async (req, res) => {
       success: false,
       message: error.message
     });
+  }
+});
+
+// Idempotent batch sync of counted events (Phase 1 of the offline-first redesign).
+// Each event carries a client-generated clientEventId (UUID); a retried batch is deduped by
+// the UNIQUE(userId, clientEventId) index instead of being double-counted. The authoritative
+// totalCount is RE-DERIVED from the immutable ledger on every call, so it self-corrects and can
+// never drift below the ledger. Runs ALONGSIDE /add-count (which is unchanged), so old and new
+// clients coexist during migration.
+router.post('/sync-events', authMiddleware, async (req, res) => {
+  try {
+    const { User, Activity, DailySummary } = getModels();
+    const events = Array.isArray(req.body.events) ? req.body.events : null;
+    if (!events || events.length === 0) {
+      return res.status(400).json({ success: false, message: 'events[] is required' });
+    }
+    if (events.length > 500) {
+      return res.status(413).json({ success: false, message: 'too many events in one batch (max 500)' });
+    }
+
+    // Validate every event up front. Reject the WHOLE batch on any malformed entry so the client
+    // keeps it queued and resends a corrected payload — never a silent partial apply.
+    const clean = [];
+    for (const e of events) {
+      const delta = Number(e && e.delta);
+      const clientEventId = e && e.clientEventId != null ? String(e.clientEventId).trim() : '';
+      if (!clientEventId || clientEventId.length > 64 || !Number.isInteger(delta) || delta <= 0) {
+        return res.status(422).json({
+          success: false,
+          message: 'each event needs a clientEventId and a positive integer delta',
+          event: e
+        });
+      }
+      const ts = e.ts ? new Date(e.ts) : new Date();
+      clean.push({ clientEventId, delta, ts: isNaN(ts.getTime()) ? new Date() : ts });
+    }
+
+    // sync-events is implemented for the SQL backend (the production database). The legacy
+    // /add-count endpoint remains available for the Mongo path, so nothing is lost there.
+    if (dbFactory.isMongoDB()) {
+      return res.status(501).json({
+        success: false,
+        message: 'sync-events is not supported on the MongoDB backend; use /add-count'
+      });
+    }
+
+    const sequelize = dbFactory.getConnection();
+    const { QueryTypes } = require('sequelize');
+
+    const result = await sequelize.transaction(async (t) => {
+      const u = await User.findByPk(req.user.userId, { transaction: t });
+      if (!u) throw new Error('user not found');
+
+      // 1) Insert ledger rows, ignoring any whose (userId, clientEventId) already exists.
+      //    ignoreDuplicates => INSERT IGNORE: a previously-applied event is skipped, not doubled.
+      const rows = clean.map((e) => ({
+        userId: req.user.userId,
+        appId: u.appId,
+        activityType: 'COUNT_INCREMENT',
+        count: e.delta,
+        clientEventId: e.clientEventId,
+        timestamp: e.ts
+      }));
+      await Activity.bulkCreate(rows, { transaction: t, ignoreDuplicates: true });
+
+      // 2) Re-derive the authoritative total from the immutable ledger (self-correcting).
+      const ledgerSum = (await Activity.sum('count', {
+        where: { userId: req.user.userId, activityType: 'COUNT_INCREMENT' },
+        transaction: t
+      })) || 0;
+      await User.update(
+        { totalCount: ledgerSum, lastActiveDate: new Date() },
+        { where: { id: req.user.userId }, fields: ['totalCount', 'lastActiveDate'], transaction: t }
+      );
+
+      // 3) Recompute each affected day's summary FROM the ledger (recompute, not increment —
+      //    so retries stay idempotent) to keep the stats screen consistent.
+      const dates = [...new Set(clean.map((e) => moment(e.ts).format('YYYY-MM-DD')))];
+      for (const d of dates) {
+        const [agg] = await sequelize.query(
+          `SELECT COALESCE(SUM(count),0) AS sum, MIN(timestamp) AS first, MAX(timestamp) AS last
+           FROM activities
+           WHERE userId = :uid AND activityType = 'COUNT_INCREMENT' AND DATE(timestamp) = :d`,
+          { replacements: { uid: req.user.userId, d }, transaction: t, type: QueryTypes.SELECT }
+        );
+        const dailyCount = Number(agg.sum) || 0;
+        const first = agg.first ? new Date(agg.first) : null;
+        const last = agg.last ? new Date(agg.last) : null;
+        const [s, created] = await DailySummary.findOrCreate({
+          where: { userId: req.user.userId, date: d },
+          defaults: {
+            userId: req.user.userId, appId: u.appId, date: d,
+            dailyCount, totalCount: ledgerSum,
+            firstCountAt: first, lastCountAt: last,
+            activeDurationSeconds: getActiveDurationSeconds(first, last)
+          },
+          transaction: t
+        });
+        if (!created) {
+          s.dailyCount = dailyCount;
+          s.totalCount = ledgerSum;
+          s.appId = u.appId;
+          s.firstCountAt = first;
+          s.lastCountAt = last;
+          s.activeDurationSeconds = getActiveDurationSeconds(first, last);
+          await s.save({
+            fields: ['dailyCount', 'totalCount', 'appId', 'firstCountAt', 'lastCountAt', 'activeDurationSeconds'],
+            transaction: t
+          });
+        }
+      }
+
+      return { totalCount: ledgerSum };
+    });
+
+    // The client can mark ALL submitted events synced — each is now durably in the ledger,
+    // whether inserted just now or already present from a prior attempt (at-least-once).
+    res.json({
+      success: true,
+      accepted: clean.map((e) => e.clientEventId),
+      totalCount: result.totalCount,
+      message: 'Events synced'
+    });
+  } catch (error) {
+    console.error('sync-events error:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 

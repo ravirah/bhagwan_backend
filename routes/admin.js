@@ -1202,4 +1202,78 @@ router.get('/reports/ram-pdf', authMiddleware, adminMiddleware, async (req, res)
   }
 });
 
+// Track D — count-drift report (admin-only, READ-ONLY). Compares each user's totalCount cache
+// against the immutable COUNT_INCREMENT ledger and surfaces drift, so ops can health-check counts
+// without shell/DB access (works on Render free tier). Point a free external scheduler
+// (e.g. cron-job.org) at this with an admin token for periodic monitoring/alerts. Healing a
+// below-ledger cache is handled by the existing POST /reconcile-counts (only ever raises).
+// Optional query: ?appId=<id> to scope to one app.
+router.get('/drift-report', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    if (dbFactory.isMongoDB()) {
+      return res.status(501).json({ success: false, message: 'drift-report is available on the SQL backend only' });
+    }
+    const sequelize = dbFactory.getConnection();
+    const appId = req.query.appId;
+    const appClause = appId ? 'AND u.appId = :appId' : '';
+    const repl = appId ? { appId } : {};
+    const LEDGER = `LEFT JOIN (SELECT userId, SUM(count) AS ledgerSum FROM activities WHERE activityType='COUNT_INCREMENT' GROUP BY userId) l ON l.userId = u.id`;
+
+    // 1) Summary counts.
+    const [summary] = await sequelize.query(
+      `SELECT COUNT(*) AS scanned,
+              SUM(u.totalCount = COALESCE(l.ledgerSum,0)) AS inSync,
+              SUM(u.totalCount > COALESCE(l.ledgerSum,0)) AS cacheAboveLedger,
+              SUM(u.totalCount < COALESCE(l.ledgerSum,0)) AS criticalBelowLedger
+         FROM users u ${LEDGER}
+        WHERE u.deletedAt IS NULL ${appClause}`,
+      { type: QueryTypes.SELECT, replacements: repl }
+    );
+
+    // 2) The critical rows — users whose shown total is BELOW their ledger (the "lost count" signal).
+    const critical = await sequelize.query(
+      `SELECT u.id, u.name, u.mobile, u.appId,
+              CAST(u.totalCount AS SIGNED) AS totalCount,
+              CAST(COALESCE(l.ledgerSum,0) AS SIGNED) AS ledgerSum,
+              CAST(u.totalCount - COALESCE(l.ledgerSum,0) AS SIGNED) AS drift
+         FROM users u ${LEDGER}
+        WHERE u.deletedAt IS NULL AND u.totalCount < COALESCE(l.ledgerSum,0) ${appClause}
+        ORDER BY drift ASC LIMIT 100`,
+      { type: QueryTypes.SELECT, replacements: repl }
+    );
+
+    // 3) Idempotency invariant — no duplicate (userId, clientEventId). Guarded for DBs missing the column.
+    let duplicateKeys = [];
+    try {
+      duplicateKeys = await sequelize.query(
+        `SELECT userId, clientEventId, COUNT(*) AS c FROM activities
+          WHERE clientEventId IS NOT NULL AND activityType='COUNT_INCREMENT'
+          GROUP BY userId, clientEventId HAVING c > 1 LIMIT 100`,
+        { type: QueryTypes.SELECT }
+      );
+    } catch (_) { /* clientEventId column absent — skip */ }
+
+    const criticalBelowLedger = Number(summary.criticalBelowLedger) || 0;
+    const healthy = criticalBelowLedger === 0 && duplicateKeys.length === 0;
+
+    res.json({
+      success: true,
+      healthy,
+      generatedAt: new Date().toISOString(),
+      summary: {
+        scanned: Number(summary.scanned) || 0,
+        inSync: Number(summary.inSync) || 0,
+        cacheAboveLedger: Number(summary.cacheAboveLedger) || 0,
+        criticalBelowLedger,
+        duplicateKeys: duplicateKeys.length,
+      },
+      critical,        // fix these via POST /api/admin/reconcile-counts (only raises to the ledger)
+      duplicateKeys,
+    });
+  } catch (error) {
+    console.error('drift-report error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;

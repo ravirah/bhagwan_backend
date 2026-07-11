@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "backfill:daily-timing": "node scripts/backfill-daily-timing.js"
+    "backfill:daily-timing": "node scripts/backfill-daily-timing.js",
+    "monitor:drift": "node scripts/monitor-count-drift.js",
+    "monitor:drift:fix": "node scripts/monitor-count-drift.js --fix"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

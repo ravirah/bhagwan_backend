@@ -1202,13 +1202,28 @@ router.get('/reports/ram-pdf', authMiddleware, adminMiddleware, async (req, res)
   }
 });
 
-// Track D — count-drift report (admin-only, READ-ONLY). Compares each user's totalCount cache
-// against the immutable COUNT_INCREMENT ledger and surfaces drift, so ops can health-check counts
-// without shell/DB access (works on Render free tier). Point a free external scheduler
-// (e.g. cron-job.org) at this with an admin token for periodic monitoring/alerts. Healing a
-// below-ledger cache is handled by the existing POST /reconcile-counts (only ever raises).
-// Optional query: ?appId=<id> to scope to one app.
-router.get('/drift-report', authMiddleware, adminMiddleware, async (req, res) => {
+// Auth for the read-only drift report: a valid admin JWT, OR a static key (for unattended
+// schedulers like cron-job.org that can't do a JWT login). The static path is enabled ONLY when
+// DRIFT_REPORT_KEY is set in the env; the key is sent via the `X-Drift-Key` header or `?key=`.
+// Constant-time compared. With no env key set, this falls back to admin-JWT only (secure default).
+const driftAuth = (req, res, next) => {
+  const secret = process.env.DRIFT_REPORT_KEY;
+  const provided = req.headers['x-drift-key'] || req.query.key;
+  if (secret && provided) {
+    const a = Buffer.from(String(provided));
+    const b = Buffer.from(String(secret));
+    if (a.length === b.length && require('crypto').timingSafeEqual(a, b)) return next();
+  }
+  // Fall back to the standard admin JWT check.
+  return authMiddleware(req, res, () => adminMiddleware(req, res, next));
+};
+
+// Track D — count-drift report (READ-ONLY). Compares each user's totalCount cache against the
+// immutable COUNT_INCREMENT ledger and surfaces drift, so ops can health-check counts without
+// shell/DB access (works on Render free tier). Point a free scheduler (e.g. cron-job.org) at this
+// with the X-Drift-Key header and alert on `healthy:false`. Healing a below-ledger cache is handled
+// by the existing POST /reconcile-counts (only ever raises). Optional query: ?appId=<id>.
+router.get('/drift-report', driftAuth, async (req, res) => {
   try {
     if (dbFactory.isMongoDB()) {
       return res.status(501).json({ success: false, message: 'drift-report is available on the SQL backend only' });
@@ -1256,7 +1271,10 @@ router.get('/drift-report', authMiddleware, adminMiddleware, async (req, res) =>
     const criticalBelowLedger = Number(summary.criticalBelowLedger) || 0;
     const healthy = criticalBelowLedger === 0 && duplicateKeys.length === 0;
 
-    res.json({
+    // Scheduler helper: with ?failUnhealthy=1, return HTTP 503 on drift so a plain uptime monitor
+    // (e.g. cron-job.org) alerts on the failed status without needing response-body matching.
+    const failUnhealthy = req.query.failUnhealthy === '1' || req.query.failUnhealthy === 'true' || req.query.alert === '1';
+    res.status(failUnhealthy && !healthy ? 503 : 200).json({
       success: true,
       healthy,
       generatedAt: new Date().toISOString(),

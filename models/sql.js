@@ -14,8 +14,17 @@ async function seedDefaultSlogans(SloganModel) {
 
 function getSyncMode() {
   const configured = String(process.env.DB_SYNC_MODE || '').trim().toLowerCase();
-  if (configured) return configured;
-  return process.env.NODE_ENV === 'production' ? 'safe' : 'alter';
+  const isProd = process.env.NODE_ENV === 'production';
+  const mode = configured || (isProd ? 'safe' : 'alter');
+  // Production safety rail: never run an ALTER/FORCE sync against live data, even if the env is
+  // misconfigured (e.g. DB_SYNC_MODE=alter copied from .env.example). alter can rewrite/drop
+  // columns and force DROPs every table — both can destroy real user counts. In production we
+  // downgrade to 'safe' (create-missing-tables only) and warn loudly instead.
+  if (isProd && (mode === 'alter' || mode === 'force')) {
+    console.warn(`⚠️ DB_SYNC_MODE='${mode}' is unsafe in production; forcing 'safe'. Set DB_SYNC_MODE=safe explicitly.`);
+    return 'safe';
+  }
+  return mode;
 }
 
 // Idempotently add a column to an existing table. Needed because safe-mode sync()

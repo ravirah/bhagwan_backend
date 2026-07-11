@@ -188,9 +188,16 @@ router.post('/sync-events', authMiddleware, async (req, res) => {
     const result = await sequelize.transaction(async (t) => {
       const u = await User.findByPk(req.user.userId, { transaction: t });
       if (!u) throw new Error('user not found');
+      const currentTotal = Number(u.totalCount || 0);
 
       // 1) Insert ledger rows, ignoring any whose (userId, clientEventId) already exists.
       //    ignoreDuplicates => INSERT IGNORE: a previously-applied event is skipped, not doubled.
+      //    We measure the ledger sum immediately before and after so newDelta counts ONLY the
+      //    rows actually inserted this call (a duplicate batch inserts nothing => newDelta 0).
+      const ledgerBefore = (await Activity.sum('count', {
+        where: { userId: req.user.userId, activityType: 'COUNT_INCREMENT' },
+        transaction: t
+      })) || 0;
       const rows = clean.map((e) => ({
         userId: req.user.userId,
         appId: u.appId,
@@ -200,19 +207,27 @@ router.post('/sync-events', authMiddleware, async (req, res) => {
         timestamp: e.ts
       }));
       await Activity.bulkCreate(rows, { transaction: t, ignoreDuplicates: true });
-
-      // 2) Re-derive the authoritative total from the immutable ledger (self-correcting).
-      const ledgerSum = (await Activity.sum('count', {
+      const ledgerAfter = (await Activity.sum('count', {
         where: { userId: req.user.userId, activityType: 'COUNT_INCREMENT' },
         transaction: t
       })) || 0;
+      const newDelta = ledgerAfter - ledgerBefore;
+
+      // 2) MONOTONIC total. Credit ONLY the newly-applied delta on top of the current cache,
+      //    and never fall below the ledger sum (self-heals an under-counted cache upward).
+      //    This GUARANTEES totalCount can never DECREASE — critical for existing users whose
+      //    cache legitimately exceeds their ledger (admin set-count / reconcile / legacy data);
+      //    the previous "set = ledgerSum" would have collapsed those users' totals. Idempotent:
+      //    a duplicate batch has newDelta 0 => newTotal = max(currentTotal, ledgerAfter) = currentTotal.
+      const newTotal = Math.max(currentTotal + newDelta, ledgerAfter);
       await User.update(
-        { totalCount: ledgerSum, lastActiveDate: new Date() },
+        { totalCount: newTotal, lastActiveDate: new Date() },
         { where: { id: req.user.userId }, fields: ['totalCount', 'lastActiveDate'], transaction: t }
       );
 
-      // 3) Recompute each affected day's summary FROM the ledger (recompute, not increment —
-      //    so retries stay idempotent) to keep the stats screen consistent.
+      // 3) Update each affected day's summary, MERGING UPWARD (Math.max) so a day that carries a
+      //    legitimate admin backfill is never lowered and reports can't regress. Idempotent under
+      //    retries (max of equal values is a no-op).
       const dates = [...new Set(clean.map((e) => moment(e.ts).format('YYYY-MM-DD')))];
       for (const d of dates) {
         const [agg] = await sequelize.query(
@@ -228,19 +243,24 @@ router.post('/sync-events', authMiddleware, async (req, res) => {
           where: { userId: req.user.userId, date: d },
           defaults: {
             userId: req.user.userId, appId: u.appId, date: d,
-            dailyCount, totalCount: ledgerSum,
+            dailyCount, totalCount: newTotal,
             firstCountAt: first, lastCountAt: last,
             activeDurationSeconds: getActiveDurationSeconds(first, last)
           },
           transaction: t
         });
         if (!created) {
-          s.dailyCount = dailyCount;
-          s.totalCount = ledgerSum;
+          const mergedDaily = Math.max(Number(s.dailyCount || 0), dailyCount);
+          const firstTimes = [s.firstCountAt, first].filter(Boolean).map((x) => new Date(x).getTime());
+          const lastTimes = [s.lastCountAt, last].filter(Boolean).map((x) => new Date(x).getTime());
+          const mergedFirst = firstTimes.length ? new Date(Math.min(...firstTimes)) : null;
+          const mergedLast = lastTimes.length ? new Date(Math.max(...lastTimes)) : null;
+          s.dailyCount = mergedDaily;
+          s.totalCount = Math.max(Number(s.totalCount || 0), newTotal);
           s.appId = u.appId;
-          s.firstCountAt = first;
-          s.lastCountAt = last;
-          s.activeDurationSeconds = getActiveDurationSeconds(first, last);
+          s.firstCountAt = mergedFirst;
+          s.lastCountAt = mergedLast;
+          s.activeDurationSeconds = getActiveDurationSeconds(mergedFirst, mergedLast);
           await s.save({
             fields: ['dailyCount', 'totalCount', 'appId', 'firstCountAt', 'lastCountAt', 'activeDurationSeconds'],
             transaction: t
@@ -248,7 +268,7 @@ router.post('/sync-events', authMiddleware, async (req, res) => {
         }
       }
 
-      return { totalCount: ledgerSum };
+      return { totalCount: newTotal };
     });
 
     // The client can mark ALL submitted events synced — each is now durably in the ledger,

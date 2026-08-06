@@ -60,6 +60,12 @@ const activitySchema = new mongoose.Schema({
     required: true,
     index: true
   },
+  appId: {
+    type: String,
+    required: true,
+    default: 'ram-bank',
+    index: true
+  },
   activityType: {
     type: String,
     required: true,
@@ -85,6 +91,12 @@ const dailySummarySchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
     required: true,
+    index: true
+  },
+  appId: {
+    type: String,
+    required: true,
+    default: 'ram-bank',
     index: true
   },
   date: {

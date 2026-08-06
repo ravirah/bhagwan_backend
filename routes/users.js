@@ -57,7 +57,11 @@ router.put('/profile', authMiddleware, async (req, res) => {
       );
     } else {
       user = await User.findByPk(req.user.userId);
-      await user.update({ name, email, mobile });
+      if (user) await user.update({ name, email, mobile });
+    }
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
 
     // Log activity

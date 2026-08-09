@@ -350,4 +350,71 @@ router.get('/daily-summary', authMiddleware, async (req, res) => {
   }
 });
 
+// User-facing राम PDF: stream THIS user's own report, generated server-side (PDFKit),
+// mirroring the admin /reports/ram-pdf but scoped HARD to req.user.userId — no admin gate,
+// and no userId query param is accepted, so a user can only ever get their own PDF.
+// This offloads the "write every राम" work from the phone to the server (the on-device
+// expo-print path lagged badly for large counts). All-time (no period) uses the authoritative
+// User.totalCount; a dated period sums this user's DailySummary (matches the admin period view).
+router.get('/ram-pdf', authMiddleware, async (req, res) => {
+  try {
+    const { User, DailySummary } = getModels();
+    const { periodStart, periodEnd } = req.query;
+
+    let user;
+    if (dbFactory.isMongoDB()) {
+      user = await User.findById(req.user.userId);
+    } else {
+      user = await User.findByPk(req.user.userId);
+    }
+    if (!user || user.deletedAt) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    let startStr = null;
+    let endStr = null;
+    let totalCount;
+
+    if (periodStart || periodEnd) {
+      const start = moment(periodStart, 'YYYY-MM-DD', true);
+      const end = moment(periodEnd, 'YYYY-MM-DD', true);
+      if (!start.isValid() || !end.isValid() || end.isBefore(start)) {
+        return res.status(400).json({ success: false, message: 'Invalid period range' });
+      }
+      startStr = start.format('YYYY-MM-DD');
+      endStr = end.format('YYYY-MM-DD');
+      let summaries;
+      if (dbFactory.isMongoDB()) {
+        summaries = await DailySummary.find({ userId: req.user.userId, date: { $gte: startStr, $lte: endStr } });
+      } else {
+        const { Op } = require('sequelize');
+        summaries = await DailySummary.findAll({ where: { userId: req.user.userId, date: { [Op.between]: [startStr, endStr] } } });
+      }
+      totalCount = summaries.reduce((sum, s) => sum + Number(s.dailyCount || 0), 0);
+    } else {
+      // All-time = the authoritative running total on the user row (same number Profile shows).
+      totalCount = Math.max(0, Math.floor(Number(user.totalCount || 0)));
+    }
+
+    const { streamRamPdf } = require('../utils/ramPdf');
+    const range = startStr && endStr ? `${startStr}_to_${endStr}` : 'all-time';
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="ram-naam-me-${range}.pdf"`);
+    streamRamPdf(res, {
+      meta: { periodStart: startStr, periodEnd: endStr, scope: 'single', generatedAt: new Date().toISOString() },
+      totals: { totalCount },
+      rows: [{
+        userId: String(user.id || user._id),
+        name: user.name || '',
+        mobile: user.mobile || '',
+        email: user.email || '',
+        totalCount,
+      }],
+    }, {});
+  } catch (error) {
+    console.error('🔴 Error generating user राम PDF:', error);
+    if (!res.headersSent) res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;

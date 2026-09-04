@@ -186,7 +186,9 @@ router.post('/sync-events', authMiddleware, async (req, res) => {
     const { QueryTypes } = require('sequelize');
 
     const result = await sequelize.transaction(async (t) => {
-      const u = await User.findByPk(req.user.userId, { transaction: t });
+      // Row lock (SELECT ... FOR UPDATE on MySQL; no-op on SQLite): admin set-count / realign-summary
+      // lock the same row, so the two can never interleave and undo each other's total.
+      const u = await User.findByPk(req.user.userId, { transaction: t, lock: t.LOCK.UPDATE });
       if (!u) throw new Error('user not found');
       const currentTotal = Number(u.totalCount || 0);
 

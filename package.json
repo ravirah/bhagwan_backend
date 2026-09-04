@@ -8,7 +8,9 @@
     "dev": "nodemon server.js",
     "backfill:daily-timing": "node scripts/backfill-daily-timing.js",
     "monitor:drift": "node scripts/monitor-count-drift.js",
-    "monitor:drift:fix": "node scripts/monitor-count-drift.js --fix"
+    "monitor:drift:fix": "node scripts/monitor-count-drift.js --fix",
+    "test:summary-alignment": "node scripts/test-summary-alignment.js",
+    "verify:summary-alignment": "node scripts/verify-summary-alignment.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

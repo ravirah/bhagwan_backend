@@ -38,16 +38,17 @@ function resolveRecoveryDate(user, recoveryDate) {
     : moment(user.createdAt || new Date()).format('YYYY-MM-DD');
 }
 
-async function backfillSummaryGap(models, user, canonicalTotal, recoveryDate) {
+async function backfillSummaryGap(models, user, canonicalTotal, recoveryDate, opts = {}) {
   const { DailySummary } = models;
   const uid = user._id || user.id;
   const date = resolveRecoveryDate(user, recoveryDate);
+  const tx = opts.transaction ? { transaction: opts.transaction } : {};
   let summarySum = 0;
   if (dbFactory.isMongoDB()) {
     const agg = await DailySummary.aggregate([{ $match: { userId: uid } }, { $group: { _id: null, total: { $sum: '$dailyCount' } } }]);
     summarySum = (agg && agg[0] && agg[0].total) || 0;
   } else {
-    summarySum = (await DailySummary.sum('dailyCount', { where: { userId: uid } })) || 0;
+    summarySum = (await DailySummary.sum('dailyCount', { where: { userId: uid }, ...tx })) || 0;
   }
   const gap = canonicalTotal - summarySum;
   if (gap <= 0) return 0;
@@ -61,15 +62,16 @@ async function backfillSummaryGap(models, user, canonicalTotal, recoveryDate) {
     const [row, created] = await DailySummary.findOrCreate({
       where: { userId: uid, date },
       defaults: { userId: uid, appId: user.appId, date, dailyCount: gap, totalCount: canonicalTotal },
+      ...tx,
     });
-    if (!created) { row.dailyCount = Number(row.dailyCount || 0) + gap; row.totalCount = canonicalTotal; await row.save(); }
+    if (!created) { row.dailyCount = Number(row.dailyCount || 0) + gap; row.totalCount = canonicalTotal; await row.save(tx); }
   }
   return gap;
 }
 
 // Per-date ledger sums for a user ('YYYY-MM-DD' -> SUM of COUNT_INCREMENT). A summary row is
 // never trimmed below its ledger sum: those counts are real, chanted events.
-async function ledgerByDate(models, uid) {
+async function ledgerByDate(models, uid, opts = {}) {
   const { Activity } = models;
   const map = new Map();
   if (dbFactory.isMongoDB()) {
@@ -83,7 +85,7 @@ async function ledgerByDate(models, uid) {
     const rows = await sequelize.query(
       `SELECT DATE(timestamp) AS d, COALESCE(SUM(count),0) AS total FROM activities
         WHERE userId = :uid AND activityType = 'COUNT_INCREMENT' GROUP BY DATE(timestamp)`,
-      { replacements: { uid }, type: QueryTypes.SELECT }
+      { replacements: { uid }, type: QueryTypes.SELECT, transaction: opts.transaction }
     );
     for (const r of rows) map.set(moment(r.d).format('YYYY-MM-DD'), Number(r.total) || 0);
   }
@@ -94,19 +96,24 @@ async function ledgerByDate(models, uid) {
 // (an admin LOWERED a count), take the excess back out of the rows that hold NON-ledger counts
 // (recovery / backfill rows), preferring the recovery date, and never lowering any day below what
 // its ledger proves was chanted. Without this a lowered total leaves a stale recovery row behind
-// and the app shows a "Best day" larger than the Total. Returns { removed, unabsorbed };
-// unabsorbed > 0 means the target is below the ledger itself, which no summary edit should hide.
-async function trimSummaryExcess(models, user, targetTotal, preferredDate) {
+// and the app shows a "Best day" larger than the Total.
+// Returns { removed, unabsorbed, changes:[{date,before,after}] }. The per-row change list goes
+// into the audit trail so a trim is reversible (for a user whose ledger is incomplete, the summary
+// rows may be the only per-day history, and they all look like slack). unabsorbed > 0 means the
+// target is below the ledger itself, which no summary edit should hide.
+async function trimSummaryExcess(models, user, targetTotal, preferredDate, opts = {}) {
   const { DailySummary } = models;
   const uid = user._id || user.id;
-  const rows = dbFactory.isMongoDB()
+  const isMongo = dbFactory.isMongoDB();
+  const tx = opts.transaction ? { transaction: opts.transaction } : {};
+  const rows = isMongo
     ? await DailySummary.find({ userId: uid })
-    : await DailySummary.findAll({ where: { userId: uid } });
+    : await DailySummary.findAll({ where: { userId: uid }, ...tx });
   const summarySum = rows.reduce((s, r) => s + Number(r.dailyCount || 0), 0);
   let excess = summarySum - targetTotal;
-  if (excess <= 0) return { removed: 0, unabsorbed: 0 };
+  if (excess <= 0) return { removed: 0, unabsorbed: 0, changes: [] };
 
-  const ledger = await ledgerByDate(models, uid);
+  const ledger = await ledgerByDate(models, uid, opts);
   const dateOf = (r) => moment(r.date).format('YYYY-MM-DD');
   const slack = (r) => Math.max(0, Number(r.dailyCount || 0) - (ledger.get(dateOf(r)) || 0));
   const ordered = rows
@@ -118,26 +125,78 @@ async function trimSummaryExcess(models, user, targetTotal, preferredDate) {
     });
 
   let removed = 0;
+  const changes = [];
   for (const r of ordered) {
     if (excess <= 0) break;
+    const before = Number(r.dailyCount || 0);
     const take = Math.min(slack(r), excess);
-    r.dailyCount = Number(r.dailyCount || 0) - take;
+    r.dailyCount = before - take;
     r.totalCount = Math.min(Number(r.totalCount || 0), targetTotal);
-    await r.save();
+    await r.save(tx);
+    changes.push({ date: dateOf(r), before, after: before - take });
     excess -= take;
     removed += take;
   }
-  return { removed, unabsorbed: excess };
+  // Running-total snapshots on the untouched rows must not advertise a total that no longer exists.
+  if (isMongo) {
+    await DailySummary.updateMany({ userId: uid, totalCount: { $gt: targetTotal } }, { $set: { totalCount: targetTotal } });
+  } else {
+    await DailySummary.update({ totalCount: targetTotal }, { where: { userId: uid, totalCount: { [Op.gt]: targetTotal } }, ...tx });
+  }
+  return { removed, unabsorbed: excess, changes };
 }
 
 // Make SUM(DailySummary) == targetTotal in BOTH directions: a positive gap is backfilled into one
-// recovery row, a negative gap is trimmed out of non-ledger rows. Returns { added, removed, unabsorbed }.
-async function alignSummaryToTotal(models, user, targetTotal, recoveryDate) {
+// recovery row, a negative gap is trimmed out of non-ledger rows.
+// Returns { added, removed, unabsorbed, changes }.
+async function alignSummaryToTotal(models, user, targetTotal, recoveryDate, opts = {}) {
   const date = resolveRecoveryDate(user, recoveryDate);
-  const added = await backfillSummaryGap(models, user, targetTotal, date);
-  if (added > 0) return { added, removed: 0, unabsorbed: 0 };
-  const { removed, unabsorbed } = await trimSummaryExcess(models, user, targetTotal, date);
-  return { added: 0, removed, unabsorbed };
+  const added = await backfillSummaryGap(models, user, targetTotal, date, opts);
+  if (added > 0) return { added, removed: 0, unabsorbed: 0, changes: [{ date, added }] };
+  const { removed, unabsorbed, changes } = await trimSummaryExcess(models, user, targetTotal, date, opts);
+  return { added: 0, removed, unabsorbed, changes };
+}
+
+// Shared core of set-count and realign-summary. On SQL it runs in ONE transaction holding a row
+// lock on the user (SELECT ... FOR UPDATE), and sync-events locks the same row, so a concurrent
+// sync cannot interleave and silently undo the admin's total or leave the summaries aligned to a
+// stale number. Returns { user, oldTotal, aligned, ledgerSum, warning }.
+async function correctUserTotal(models, user, newTotal, recoveryDate) {
+  const { User, Activity } = models;
+  const isMongo = dbFactory.isMongoDB();
+
+  const run = async (t) => {
+    const opts = t ? { transaction: t } : {};
+    let u = user;
+    if (!isMongo) u = await User.findByPk(user.id, { ...opts, lock: t ? t.LOCK.UPDATE : undefined });
+    if (!u) throw new Error('User not found');
+    const oldTotal = Number(u.totalCount || 0);
+    if (isMongo) { u.totalCount = newTotal; await u.save(); }
+    else { await User.update({ totalCount: newTotal }, { where: { id: u.id }, ...opts }); }
+
+    const aligned = await alignSummaryToTotal(models, u, newTotal, recoveryDate, opts);
+
+    // Ledger sum for the caller's warning: a total set below the chanted ledger is not durable —
+    // the next sync-events call raises it back to the ledger (monotonic guarantee).
+    let ledgerSum = 0;
+    if (isMongo) {
+      const agg = await Activity.aggregate([
+        { $match: { userId: u._id, activityType: 'COUNT_INCREMENT' } },
+        { $group: { _id: null, total: { $sum: '$count' } } },
+      ]);
+      ledgerSum = (agg && agg[0] && agg[0].total) || 0;
+    } else {
+      ledgerSum = (await Activity.sum('count', { where: { userId: u.id, activityType: 'COUNT_INCREMENT' }, ...opts })) || 0;
+    }
+    return { oldTotal, aligned, ledgerSum };
+  };
+
+  const result = isMongo ? await run(null) : await dbFactory.getConnection().transaction(run);
+  const fresh = isMongo ? await User.findById(user._id) : await User.findByPk(user.id);
+  const warning = newTotal < result.ledgerSum
+    ? `totalCount (${newTotal}) is below the chanted ledger (${result.ledgerSum}); the next sync will raise it back to the ledger`
+    : null;
+  return { ...result, user: fresh, warning };
 }
 
 // Get all users
@@ -375,7 +434,9 @@ router.post('/reconcile-counts', authMiddleware, adminMiddleware, async (req, re
       const current = Number(u.totalCount || 0);
       const canonical = Math.max(current, ledger);
       if (summarySum > canonical) {
-        results.summaryAboveTotal.push({ id: uid, mobile: u.mobile, totalCount: canonical, summarySum, excess: summarySum - canonical });
+        // ledgerSum ~= totalCount => stale recovery row (realign-summary fixes it);
+        // ledgerSum << summarySum  => the summary may be the only record of real counts — investigate first.
+        results.summaryAboveTotal.push({ id: uid, mobile: u.mobile, totalCount: canonical, ledgerSum: ledger, summarySum, excess: summarySum - canonical });
       }
 
       let changed = false;
@@ -486,43 +547,57 @@ router.put('/users/:userId/set-count', authMiddleware, adminMiddleware, async (r
     else user = await User.findByPk(userId);
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
-    const oldTotal = Number(user.totalCount || 0);
-    if (dbFactory.isMongoDB()) { user.totalCount = newTotal; await user.save(); }
-    else { await User.update({ totalCount: newTotal }, { where: { id: user.id } }); user = await User.findByPk(user.id); }
-
     // Enforce SUM(DailySummary) == newTotal in BOTH directions so reports/PDF and the app's
-    // "Best day" match the corrected total (a lowered total trims stale recovery rows).
-    // No silent catch — if this throws, the request returns 500 (no half-applied state).
-    const aligned = await alignSummaryToTotal(getModels(), user, newTotal, req.body.recoveryDate);
-
-    // Ledger sum for the warning below: a total set below the chanted ledger is not durable —
-    // the next sync-events call raises it back to the ledger (monotonic guarantee).
-    const { Activity } = getModels();
-    let ledgerSum = 0;
-    if (dbFactory.isMongoDB()) {
-      const agg = await Activity.aggregate([
-        { $match: { userId: user._id, activityType: 'COUNT_INCREMENT' } },
-        { $group: { _id: null, total: { $sum: '$count' } } },
-      ]);
-      ledgerSum = (agg && agg[0] && agg[0].total) || 0;
-    } else {
-      ledgerSum = (await Activity.sum('count', { where: { userId: user.id, activityType: 'COUNT_INCREMENT' } })) || 0;
-    }
-    const warning = newTotal < ledgerSum
-      ? `totalCount (${newTotal}) is below the chanted ledger (${ledgerSum}); the next sync will raise it back to the ledger`
-      : null;
+    // "Best day" match the corrected total (a lowered total trims stale recovery rows). Runs in
+    // one transaction with a row lock; if anything throws, nothing is applied and we return 500.
+    const r = await correctUserTotal(getModels(), user, newTotal, req.body.recoveryDate);
 
     await logAdminAction(req, 'SET_COUNT', {
       targetUserId: user._id || user.id, targetMobile: user.mobile,
       details: {
-        from: oldTotal, to: newTotal, reason: req.body.reason || null,
-        recoverySummaryAdded: aligned.added, summaryTrimmed: aligned.removed, summaryUnabsorbed: aligned.unabsorbed,
+        from: r.oldTotal, to: newTotal, reason: req.body.reason || null,
+        recoverySummaryAdded: r.aligned.added, summaryTrimmed: r.aligned.removed, summaryUnabsorbed: r.aligned.unabsorbed,
+        summaryChanges: r.aligned.changes,
       },
     });
     res.json({
-      success: true, user, from: oldTotal, to: newTotal,
-      recoverySummaryAdded: aligned.added, summaryTrimmed: aligned.removed, summaryUnabsorbed: aligned.unabsorbed,
-      ledgerSum, warning,
+      success: true, user: r.user, from: r.oldTotal, to: newTotal,
+      recoverySummaryAdded: r.aligned.added, summaryTrimmed: r.aligned.removed, summaryUnabsorbed: r.aligned.unabsorbed,
+      summaryChanges: r.aligned.changes, ledgerSum: r.ledgerSum, warning: r.warning,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Re-align a user's DailySummary rows to their CURRENT total without changing the total. This is
+// the repair for a drift-report / reconcile-counts "summaryAboveTotal" entry (a stale recovery row
+// left behind by an earlier lowered total). The admin app cannot submit set-count with an unchanged
+// value, so this endpoint exists for exactly that case. Audited as REALIGN_SUMMARY.
+router.post('/users/:userId/realign-summary', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { User } = getModels();
+    const { userId } = req.params;
+    let user;
+    if (dbFactory.isMongoDB()) user = await User.findById(userId);
+    else user = await User.findByPk(userId);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const total = Number(user.totalCount || 0);
+    const r = await correctUserTotal(getModels(), user, total, req.body && req.body.recoveryDate);
+
+    await logAdminAction(req, 'REALIGN_SUMMARY', {
+      targetUserId: user._id || user.id, targetMobile: user.mobile,
+      details: {
+        totalCount: total, reason: (req.body && req.body.reason) || null,
+        recoverySummaryAdded: r.aligned.added, summaryTrimmed: r.aligned.removed, summaryUnabsorbed: r.aligned.unabsorbed,
+        summaryChanges: r.aligned.changes,
+      },
+    });
+    res.json({
+      success: true, user: r.user, totalCount: total,
+      recoverySummaryAdded: r.aligned.added, summaryTrimmed: r.aligned.removed, summaryUnabsorbed: r.aligned.unabsorbed,
+      summaryChanges: r.aligned.changes, ledgerSum: r.ledgerSum, warning: r.warning,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -1377,16 +1452,20 @@ router.get('/drift-report', driftAuth, async (req, res) => {
 
     // 4) Display-consistency invariant — SUM(DailySummary) must not exceed the user's total. When it
     //    does, the app shows a "Best day" larger than the Total (stale recovery row after a lowered
-    //    total). Fix: PUT /api/admin/users/:id/set-count with the SAME total re-aligns the rows.
+    //    total). Fix: POST /api/admin/users/:id/realign-summary. ledgerSum is included so a stale
+    //    row (ledgerSum ~= totalCount) can be told apart from summary-only real history
+    //    (ledgerSum << summarySum), which deserves a look before anything is trimmed.
     const summaryAboveTotal = await sequelize.query(
       `SELECT u.id, u.name, u.mobile, u.appId,
               CAST(u.totalCount AS SIGNED) AS totalCount,
+              CAST(COALESCE(l.ledgerSum,0) AS SIGNED) AS ledgerSum,
               CAST(s.summarySum AS SIGNED) AS summarySum,
               CAST(s.bestDay AS SIGNED) AS bestDay,
               CAST(s.summarySum - u.totalCount AS SIGNED) AS excess
          FROM users u
          JOIN (SELECT userId, SUM(dailyCount) AS summarySum, MAX(dailyCount) AS bestDay
                  FROM dailysummaries GROUP BY userId) s ON s.userId = u.id
+         ${LEDGER}
         WHERE u.deletedAt IS NULL AND s.summarySum > u.totalCount ${appClause}
         ORDER BY excess DESC LIMIT 100`,
       { type: QueryTypes.SELECT, replacements: repl }
@@ -1412,7 +1491,7 @@ router.get('/drift-report', driftAuth, async (req, res) => {
       },
       critical,        // fix these via POST /api/admin/reconcile-counts (only raises to the ledger)
       duplicateKeys,
-      summaryAboveTotal, // fix each via PUT /api/admin/users/:id/set-count with the same totalCount
+      summaryAboveTotal, // fix each via POST /api/admin/users/:id/realign-summary
     });
   } catch (error) {
     console.error('drift-report error:', error);

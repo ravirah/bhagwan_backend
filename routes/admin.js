@@ -32,12 +32,16 @@ async function logAdminAction(req, action, { targetUserId = null, targetMobile =
 // adding a single recovery DailySummary row for the gap (reports sum DailySummary, so
 // without this a restored totalCount under-reports). Returns the gap added. THROWS on
 // failure (callers surface a 500) — recovery must never silently leave a gap.
+function resolveRecoveryDate(user, recoveryDate) {
+  return (typeof recoveryDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(recoveryDate))
+    ? recoveryDate
+    : moment(user.createdAt || new Date()).format('YYYY-MM-DD');
+}
+
 async function backfillSummaryGap(models, user, canonicalTotal, recoveryDate) {
   const { DailySummary } = models;
   const uid = user._id || user.id;
-  const date = (typeof recoveryDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(recoveryDate))
-    ? recoveryDate
-    : moment(user.createdAt || new Date()).format('YYYY-MM-DD');
+  const date = resolveRecoveryDate(user, recoveryDate);
   let summarySum = 0;
   if (dbFactory.isMongoDB()) {
     const agg = await DailySummary.aggregate([{ $match: { userId: uid } }, { $group: { _id: null, total: { $sum: '$dailyCount' } } }]);
@@ -61,6 +65,79 @@ async function backfillSummaryGap(models, user, canonicalTotal, recoveryDate) {
     if (!created) { row.dailyCount = Number(row.dailyCount || 0) + gap; row.totalCount = canonicalTotal; await row.save(); }
   }
   return gap;
+}
+
+// Per-date ledger sums for a user ('YYYY-MM-DD' -> SUM of COUNT_INCREMENT). A summary row is
+// never trimmed below its ledger sum: those counts are real, chanted events.
+async function ledgerByDate(models, uid) {
+  const { Activity } = models;
+  const map = new Map();
+  if (dbFactory.isMongoDB()) {
+    const rows = await Activity.aggregate([
+      { $match: { userId: uid, activityType: 'COUNT_INCREMENT' } },
+      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$timestamp' } }, total: { $sum: '$count' } } },
+    ]);
+    for (const r of rows) map.set(r._id, Number(r.total) || 0);
+  } else {
+    const sequelize = dbFactory.getConnection();
+    const rows = await sequelize.query(
+      `SELECT DATE(timestamp) AS d, COALESCE(SUM(count),0) AS total FROM activities
+        WHERE userId = :uid AND activityType = 'COUNT_INCREMENT' GROUP BY DATE(timestamp)`,
+      { replacements: { uid }, type: QueryTypes.SELECT }
+    );
+    for (const r of rows) map.set(moment(r.d).format('YYYY-MM-DD'), Number(r.total) || 0);
+  }
+  return map;
+}
+
+// Inverse of backfillSummaryGap. When SUM(DailySummary.dailyCount) EXCEEDS the target total
+// (an admin LOWERED a count), take the excess back out of the rows that hold NON-ledger counts
+// (recovery / backfill rows), preferring the recovery date, and never lowering any day below what
+// its ledger proves was chanted. Without this a lowered total leaves a stale recovery row behind
+// and the app shows a "Best day" larger than the Total. Returns { removed, unabsorbed };
+// unabsorbed > 0 means the target is below the ledger itself, which no summary edit should hide.
+async function trimSummaryExcess(models, user, targetTotal, preferredDate) {
+  const { DailySummary } = models;
+  const uid = user._id || user.id;
+  const rows = dbFactory.isMongoDB()
+    ? await DailySummary.find({ userId: uid })
+    : await DailySummary.findAll({ where: { userId: uid } });
+  const summarySum = rows.reduce((s, r) => s + Number(r.dailyCount || 0), 0);
+  let excess = summarySum - targetTotal;
+  if (excess <= 0) return { removed: 0, unabsorbed: 0 };
+
+  const ledger = await ledgerByDate(models, uid);
+  const dateOf = (r) => moment(r.date).format('YYYY-MM-DD');
+  const slack = (r) => Math.max(0, Number(r.dailyCount || 0) - (ledger.get(dateOf(r)) || 0));
+  const ordered = rows
+    .filter((r) => slack(r) > 0)
+    .sort((a, b) => {
+      const ap = dateOf(a) === preferredDate ? 1 : 0;
+      const bp = dateOf(b) === preferredDate ? 1 : 0;
+      return (bp - ap) || (slack(b) - slack(a));
+    });
+
+  let removed = 0;
+  for (const r of ordered) {
+    if (excess <= 0) break;
+    const take = Math.min(slack(r), excess);
+    r.dailyCount = Number(r.dailyCount || 0) - take;
+    r.totalCount = Math.min(Number(r.totalCount || 0), targetTotal);
+    await r.save();
+    excess -= take;
+    removed += take;
+  }
+  return { removed, unabsorbed: excess };
+}
+
+// Make SUM(DailySummary) == targetTotal in BOTH directions: a positive gap is backfilled into one
+// recovery row, a negative gap is trimmed out of non-ledger rows. Returns { added, removed, unabsorbed }.
+async function alignSummaryToTotal(models, user, targetTotal, recoveryDate) {
+  const date = resolveRecoveryDate(user, recoveryDate);
+  const added = await backfillSummaryGap(models, user, targetTotal, date);
+  if (added > 0) return { added, removed: 0, unabsorbed: 0 };
+  const { removed, unabsorbed } = await trimSummaryExcess(models, user, targetTotal, date);
+  return { added: 0, removed, unabsorbed };
 }
 
 // Get all users
@@ -266,7 +343,7 @@ router.post('/reconcile-counts', authMiddleware, adminMiddleware, async (req, re
   try {
     const models = getModels();
     const { User, Activity, DailySummary } = models;
-    const results = { checked: 0, restored: 0, summaryBackfilled: 0, details: [] };
+    const results = { checked: 0, restored: 0, summaryBackfilled: 0, summaryAboveTotal: [], details: [] };
     const isMongo = dbFactory.isMongoDB();
 
     const users = isMongo ? await User.find({}) : await User.findAll();
@@ -284,7 +361,9 @@ router.post('/reconcile-counts', authMiddleware, adminMiddleware, async (req, re
       } else {
         ledger = (await Activity.sum('count', { where: { userId: uid, activityType: 'COUNT_INCREMENT' } })) || 0;
       }
-      // Floor 2: existing daily-summary sum.
+      // Daily-summary sum: NOT a floor. Summary rows can legitimately sit above the total when an
+      // admin lowered a count via set-count, so trusting them here would re-inflate a corrected
+      // total (e.g. 4.1L -> 11.6L). Surface such users instead; set-count re-aligns them.
       let summarySum = 0;
       if (isMongo) {
         const agg = await DailySummary.aggregate([{ $match: { userId: u._id } }, { $group: { _id: null, total: { $sum: '$dailyCount' } } }]);
@@ -292,9 +371,12 @@ router.post('/reconcile-counts', authMiddleware, adminMiddleware, async (req, re
       } else {
         summarySum = (await DailySummary.sum('dailyCount', { where: { userId: uid } })) || 0;
       }
-      // Canonical = highest of the three (never lowers a count).
+      // Canonical = higher of the cached total and the immutable ledger (never lowers a count).
       const current = Number(u.totalCount || 0);
-      const canonical = Math.max(current, ledger, summarySum);
+      const canonical = Math.max(current, ledger);
+      if (summarySum > canonical) {
+        results.summaryAboveTotal.push({ id: uid, mobile: u.mobile, totalCount: canonical, summarySum, excess: summarySum - canonical });
+      }
 
       let changed = false;
       if (canonical > current) {
@@ -309,7 +391,7 @@ router.post('/reconcile-counts', authMiddleware, adminMiddleware, async (req, re
       if (changed) results.details.push({ id: uid, mobile: u.mobile, from: current, to: canonical, summaryGapAdded: backfilled });
     }
 
-    await logAdminAction(req, 'RECONCILE_COUNTS', { details: { checked: results.checked, restored: results.restored, summaryBackfilled: results.summaryBackfilled } });
+    await logAdminAction(req, 'RECONCILE_COUNTS', { details: { checked: results.checked, restored: results.restored, summaryBackfilled: results.summaryBackfilled, summaryAboveTotal: results.summaryAboveTotal.length } });
     res.json({ success: true, ...results });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -408,15 +490,40 @@ router.put('/users/:userId/set-count', authMiddleware, adminMiddleware, async (r
     if (dbFactory.isMongoDB()) { user.totalCount = newTotal; await user.save(); }
     else { await User.update({ totalCount: newTotal }, { where: { id: user.id } }); user = await User.findByPk(user.id); }
 
-    // Enforce SUM(DailySummary) == newTotal so reports/PDF match the restored total.
+    // Enforce SUM(DailySummary) == newTotal in BOTH directions so reports/PDF and the app's
+    // "Best day" match the corrected total (a lowered total trims stale recovery rows).
     // No silent catch — if this throws, the request returns 500 (no half-applied state).
-    const recoveryAdded = await backfillSummaryGap(getModels(), user, newTotal, req.body.recoveryDate);
+    const aligned = await alignSummaryToTotal(getModels(), user, newTotal, req.body.recoveryDate);
+
+    // Ledger sum for the warning below: a total set below the chanted ledger is not durable —
+    // the next sync-events call raises it back to the ledger (monotonic guarantee).
+    const { Activity } = getModels();
+    let ledgerSum = 0;
+    if (dbFactory.isMongoDB()) {
+      const agg = await Activity.aggregate([
+        { $match: { userId: user._id, activityType: 'COUNT_INCREMENT' } },
+        { $group: { _id: null, total: { $sum: '$count' } } },
+      ]);
+      ledgerSum = (agg && agg[0] && agg[0].total) || 0;
+    } else {
+      ledgerSum = (await Activity.sum('count', { where: { userId: user.id, activityType: 'COUNT_INCREMENT' } })) || 0;
+    }
+    const warning = newTotal < ledgerSum
+      ? `totalCount (${newTotal}) is below the chanted ledger (${ledgerSum}); the next sync will raise it back to the ledger`
+      : null;
 
     await logAdminAction(req, 'SET_COUNT', {
       targetUserId: user._id || user.id, targetMobile: user.mobile,
-      details: { from: oldTotal, to: newTotal, recoverySummaryAdded: recoveryAdded, reason: req.body.reason || null },
+      details: {
+        from: oldTotal, to: newTotal, reason: req.body.reason || null,
+        recoverySummaryAdded: aligned.added, summaryTrimmed: aligned.removed, summaryUnabsorbed: aligned.unabsorbed,
+      },
     });
-    res.json({ success: true, user, from: oldTotal, to: newTotal, recoverySummaryAdded: recoveryAdded });
+    res.json({
+      success: true, user, from: oldTotal, to: newTotal,
+      recoverySummaryAdded: aligned.added, summaryTrimmed: aligned.removed, summaryUnabsorbed: aligned.unabsorbed,
+      ledgerSum, warning,
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1268,8 +1375,25 @@ router.get('/drift-report', driftAuth, async (req, res) => {
       );
     } catch (_) { /* clientEventId column absent — skip */ }
 
+    // 4) Display-consistency invariant — SUM(DailySummary) must not exceed the user's total. When it
+    //    does, the app shows a "Best day" larger than the Total (stale recovery row after a lowered
+    //    total). Fix: PUT /api/admin/users/:id/set-count with the SAME total re-aligns the rows.
+    const summaryAboveTotal = await sequelize.query(
+      `SELECT u.id, u.name, u.mobile, u.appId,
+              CAST(u.totalCount AS SIGNED) AS totalCount,
+              CAST(s.summarySum AS SIGNED) AS summarySum,
+              CAST(s.bestDay AS SIGNED) AS bestDay,
+              CAST(s.summarySum - u.totalCount AS SIGNED) AS excess
+         FROM users u
+         JOIN (SELECT userId, SUM(dailyCount) AS summarySum, MAX(dailyCount) AS bestDay
+                 FROM dailysummaries GROUP BY userId) s ON s.userId = u.id
+        WHERE u.deletedAt IS NULL AND s.summarySum > u.totalCount ${appClause}
+        ORDER BY excess DESC LIMIT 100`,
+      { type: QueryTypes.SELECT, replacements: repl }
+    );
+
     const criticalBelowLedger = Number(summary.criticalBelowLedger) || 0;
-    const healthy = criticalBelowLedger === 0 && duplicateKeys.length === 0;
+    const healthy = criticalBelowLedger === 0 && duplicateKeys.length === 0 && summaryAboveTotal.length === 0;
 
     // Scheduler helper: with ?failUnhealthy=1, return HTTP 503 on drift so a plain uptime monitor
     // (e.g. cron-job.org) alerts on the failed status without needing response-body matching.
@@ -1284,9 +1408,11 @@ router.get('/drift-report', driftAuth, async (req, res) => {
         cacheAboveLedger: Number(summary.cacheAboveLedger) || 0,
         criticalBelowLedger,
         duplicateKeys: duplicateKeys.length,
+        summaryAboveTotal: summaryAboveTotal.length,
       },
       critical,        // fix these via POST /api/admin/reconcile-counts (only raises to the ledger)
       duplicateKeys,
+      summaryAboveTotal, // fix each via PUT /api/admin/users/:id/set-count with the same totalCount
     });
   } catch (error) {
     console.error('drift-report error:', error);

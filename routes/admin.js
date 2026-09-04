@@ -55,16 +55,21 @@ async function backfillSummaryGap(models, user, canonicalTotal, recoveryDate, op
   if (dbFactory.isMongoDB()) {
     await DailySummary.findOneAndUpdate(
       { userId: uid, date },
-      { $inc: { dailyCount: gap }, $set: { appId: user.appId, totalCount: canonicalTotal }, $setOnInsert: { userId: uid, date } },
+      { $inc: { dailyCount: gap, recoveryCount: gap }, $set: { appId: user.appId, totalCount: canonicalTotal }, $setOnInsert: { userId: uid, date } },
       { upsert: true, new: true }
     );
   } else {
     const [row, created] = await DailySummary.findOrCreate({
       where: { userId: uid, date },
-      defaults: { userId: uid, appId: user.appId, date, dailyCount: gap, totalCount: canonicalTotal },
+      defaults: { userId: uid, appId: user.appId, date, dailyCount: gap, recoveryCount: gap, totalCount: canonicalTotal },
       ...tx,
     });
-    if (!created) { row.dailyCount = Number(row.dailyCount || 0) + gap; row.totalCount = canonicalTotal; await row.save(tx); }
+    if (!created) {
+      row.dailyCount = Number(row.dailyCount || 0) + gap;
+      row.recoveryCount = Number(row.recoveryCount || 0) + gap;
+      row.totalCount = canonicalTotal;
+      await row.save(tx);
+    }
   }
   return gap;
 }
@@ -131,6 +136,10 @@ async function trimSummaryExcess(models, user, targetTotal, preferredDate, opts 
     const before = Number(r.dailyCount || 0);
     const take = Math.min(slack(r), excess);
     r.dailyCount = before - take;
+    // Whatever non-ledger count remains in the row after the trim is, by definition, recovery
+    // (the ledger holds every chanted event). Recompute the marker from that rather than from
+    // its old value so an UNMARKED inflated row ends up correctly labelled too.
+    r.recoveryCount = Math.max(0, (before - take) - (ledger.get(dateOf(r)) || 0));
     r.totalCount = Math.min(Number(r.totalCount || 0), targetTotal);
     await r.save(tx);
     changes.push({ date: dateOf(r), before, after: before - take });

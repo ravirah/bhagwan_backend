@@ -128,6 +128,11 @@ const dailySummarySchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // Portion of dailyCount that came from an admin recovery/backfill, not chanting.
+  recoveryCount: {
+    type: Number,
+    default: 0
+  },
   createdAt: {
     type: Date,
     default: Date.now

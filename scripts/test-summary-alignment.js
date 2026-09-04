@@ -48,7 +48,7 @@ const check = (label, cond, extra) => {
   if (!cond) failures++;
 };
 const snapshot = async (uid) => {
-  const rows = await sql('SELECT date, dailyCount, totalCount FROM dailysummaries WHERE userId=? ORDER BY date', [uid]);
+  const rows = await sql('SELECT date, dailyCount, recoveryCount, totalCount FROM dailysummaries WHERE userId=? ORDER BY date', [uid]);
   const [{ totalCount }] = await sql('SELECT totalCount FROM users WHERE id=?', [uid]);
   return { totalCount, summarySum: rows.reduce((s, r) => s + r.dailyCount, 0), rows };
 };
@@ -88,6 +88,7 @@ const finish = () => {
   r = await setCount(345678);
   s = await snapshot(uid);
   check('set-count UP 345678 backfills recovery row on signup date', r.recoverySummaryAdded === 344678 && s.summarySum === 345678 && s.rows[0].date === '2026-06-10' && s.rows[0].dailyCount === 344678, { r, s });
+  check('recovery row is marked: recoveryCount == dailyCount; chanted day unmarked', s.rows[0].recoveryCount === 344678 && s.rows[1].recoveryCount === 0, s.rows);
 
   r = await setCount(845678);
   s = await snapshot(uid);
@@ -96,6 +97,7 @@ const finish = () => {
   r = await setCount(100000);
   s = await snapshot(uid);
   check('set-count DOWN 100000 trims recovery row, keeps ledger day', r.summaryTrimmed === 745678 && s.summarySum === 100000 && s.rows[0].dailyCount === 99000 && s.rows[1].dailyCount === 1000, { r, s });
+  check('recoveryCount follows the trim', s.rows[0].recoveryCount === 99000, s.rows[0]);
   check('trim is recorded per row in the response', Array.isArray(r.summaryChanges) && r.summaryChanges.length === 1 && r.summaryChanges[0].date === '2026-06-10' && r.summaryChanges[0].before === 844678 && r.summaryChanges[0].after === 99000, r.summaryChanges);
   check('no row advertises a running total above the new total', s.rows.every((x) => x.totalCount <= 100000), s.rows);
   const audit = await sql("SELECT details FROM auditlogs WHERE action='SET_COUNT' ORDER BY id DESC LIMIT 1");
@@ -109,6 +111,7 @@ const finish = () => {
   r = await setCount(414931);
   s = await snapshot(uid);
   check('set-count UP again re-backfills into the existing recovery row', s.summarySum === 414931 && s.rows.length === 2 && s.rows[0].dailyCount === 413931, s);
+  check('recoveryCount rebuilt from 0 through the backfill', s.rows[0].recoveryCount === 413931, s.rows[0]);
 
   // sync-events still works with the row lock and stays monotonic after an admin correction.
   r = await j('/activities/sync-events', { method: 'POST', body: JSON.stringify({ events: [{ clientEventId: 'evt-lock-1', delta: 69 }] }), ...U });
@@ -134,6 +137,7 @@ const finish = () => {
   r = await j(`/admin/users/${uid}/realign-summary`, { method: 'POST', body: JSON.stringify({ reason: 'test realign' }), ...A });
   s = await snapshot(uid);
   check('realign-summary trims the inflated row back without touching the total', r.success === true && r.totalCount === 415000 && r.summaryTrimmed === 745694 && s.totalCount === 415000 && s.summarySum === 415000 && s.rows[0].dailyCount === 413931, { r, s });
+  check('unmarked inflation trimmed away leaves the marker equal to the remaining non-ledger count', s.rows[0].recoveryCount === 413931, s.rows[0]);
   const realignAudit = await sql("SELECT details FROM auditlogs WHERE action='REALIGN_SUMMARY' ORDER BY id DESC LIMIT 1");
   check('realign-summary is audited with per-row changes', realignAudit.length === 1 && JSON.parse(realignAudit[0].details).summaryChanges[0].before === 413931 + 745694, realignAudit);
 
@@ -147,6 +151,8 @@ const finish = () => {
   const ds = await j('/activities/daily-summary?days=30', U);
   const best = Math.max(...(ds.summaries || []).map((x) => x.dailyCount));
   check('user daily-summary best day <= total', best <= s.totalCount, { best, total: s.totalCount });
+  const rec = (ds.summaries || []).find((x) => x.date === '2026-06-10');
+  check('user daily-summary exposes recoveryCount so the app can skip the lump for Best/streaks', rec && rec.recoveryCount === 413931 && (rec.dailyCount - rec.recoveryCount) === 0, rec);
 
   finish();
 })().catch((e) => { console.error('ERR', e); failures++; finish(); });

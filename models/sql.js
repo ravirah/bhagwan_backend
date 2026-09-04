@@ -251,6 +251,14 @@ async function initModels(sequelize) {
     activeDurationSeconds: {
       type: DataTypes.INTEGER,
       defaultValue: 0
+    },
+    // Portion of dailyCount that came from an admin recovery/backfill (set-count, reconcile)
+    // rather than chanting. dailyCount - recoveryCount = what the user actually counted that
+    // day. Reports/totals keep using dailyCount; the app uses the difference for Best day,
+    // days active and streaks so a recovery lump never poses as a record day.
+    recoveryCount: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0
     }
   }, {
     tableName: 'dailysummaries',
@@ -335,6 +343,7 @@ async function initModels(sequelize) {
   // Idempotency support for the offline sync queue (Phase 0). Adds the column + the
   // dedupe index on existing tables in safe mode; a no-op once already present.
   await ensureColumn(sequelize, 'activities', 'clientEventId VARCHAR(64) NULL', 'clientEventId');
+  await ensureColumn(sequelize, 'dailysummaries', 'recoveryCount INTEGER NOT NULL DEFAULT 0', 'recoveryCount');
   await ensureUniqueIndex(sequelize, 'activities', 'uniq_activity_user_event', ['userId', 'clientEventId']);
   await seedDefaultSlogans(Slogan);
 
